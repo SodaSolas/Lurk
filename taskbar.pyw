@@ -91,10 +91,15 @@ def kill_on_close_job(*processes):
     if set_job_info(job, 9, ct.byref(limits), ct.sizeof(limits)):
         for process in processes:
             handle = open_process(0x0101, False, process.pid)  # SET_QUOTA | TERMINATE
-            if handle:
-                assign_job(job, handle)
+            if not handle:
+                break
+            try:
+                if not assign_job(job, handle):
+                    break
+            finally:
                 close_handle(handle)
-        return job
+        else:
+            return job
     close_handle(job)
     return None
 
@@ -201,6 +206,10 @@ def web_get(url, timeout=5):
 
 def fetch_face(uid):
     """Return (url, image bytes) for a streamer's avatar, cached for a week."""
+    try:
+        uid = int(uid)
+    except (ValueError, TypeError, OverflowError):
+        return None, None
     cache = STATE_DIR / "faces"
     image, link = cache / f"{uid}.img", cache / f"{uid}.url"
     try:
@@ -209,14 +218,14 @@ def fetch_face(uid):
     except OSError:
         pass
     try:
-        data = json.loads(web_get(f"https://api.live.bilibili.com/live_user/v1/Master/info?uid={int(uid)}"))
+        data = json.loads(web_get(f"https://api.live.bilibili.com/live_user/v1/Master/info?uid={uid}"))
         url = data["data"]["info"]["face"].replace("http://", "https://", 1)
         content = web_get(url, 10)
         cache.mkdir(exist_ok=True)
         image.write_bytes(content)
         link.write_text(url, encoding="utf-8")
         return url, content
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         logging.debug("Avatar unavailable for %s", uid, exc_info=True)
         return None, None
 
@@ -274,6 +283,8 @@ class Playback:
             finally:
                 self.stream.stdout.close()
             self.job = kill_on_close_job(self.stream, self.player)
+            if not self.job:
+                raise OSError("Could not attach playback processes to the Windows job")
         except Exception:
             self.close()
             raise
@@ -306,9 +317,11 @@ class Playback:
             try:
                 command = {"command": ["set_property", "volume", value]}
                 with open(self.pipe, "wb", buffering=0) as pipe:
-                    pipe.write((json.dumps(command) + "\n").encode("ascii"))
+                    payload = (json.dumps(command) + "\n").encode("ascii")
+                    return pipe.write(payload) == len(payload)
             except OSError:
                 logging.debug("mpv volume IPC unavailable", exc_info=True)
+        return False
 
     def status(self):
         if not self.ready and self.player_log.exists():
@@ -1029,6 +1042,7 @@ class Radio(QtCore.QObject):
         self.panel.update()
 
     def build_panel(self):
+        self.follow_height = None
         self.panel.setFixedWidth(368)
         self.panel.setFont(app_font(12))
         outer = QtWidgets.QVBoxLayout(self.panel)
@@ -1205,6 +1219,7 @@ class Radio(QtCore.QObject):
         followed_header.setSpacing(4)
         self.account_status = label(muted=True)
         self.account_status.setWordWrap(True)
+        self.account_status.setFixedHeight(32)
         followed_header.addWidget(self.account_status, 1)
         self.account_refresh = icon_button("refresh", self.refresh_followed, "刷新", 28, 13)
         followed_header.addWidget(self.account_refresh)
@@ -1283,11 +1298,15 @@ class Radio(QtCore.QObject):
         self.fit_lists()
 
     def fit_lists(self):
-        """Lists hug their rows and scroll past four; the panel hugs the current tab."""
+        """Keep the signed-in follow page stable while its list refreshes."""
         for view in [self.followed, *self.room_views]:
             rows = view.count()
-            view.setFixedHeight(min(rows, 4) * 46)
-            view.setVisible(rows > 0 and (view is not self.followed or bool(self.cookies)))
+            if view is self.followed:
+                view.setFixedHeight(4 * 46)
+                view.setVisible(bool(self.cookies))
+            else:
+                view.setFixedHeight(min(rows, 4) * 46)
+                view.setVisible(rows > 0)
         current = self.pages.currentIndex()
         for index in range(self.pages.count()):
             # QStackedWidget sizes to its largest page unless the others are Ignored.
@@ -1308,6 +1327,7 @@ class Radio(QtCore.QObject):
         self.tabs.active = True
         self.tabs.update()
         self.pages.setCurrentIndex(index)
+        self.follow_height = None
         self.settings_button.setStyleSheet("")
         self.fit_lists()
 
@@ -1722,8 +1742,9 @@ class Radio(QtCore.QObject):
 
             def poll():
                 status = session.status()
-                if session.ready and getattr(session, "applied_volume", None) != volume:
-                    session.volume(volume)
+                if (not status and session.ready
+                        and getattr(session, "applied_volume", None) != volume
+                        and session.volume(volume)):
                     session.applied_volume = volume
                 return status
 
@@ -1882,6 +1903,8 @@ class Radio(QtCore.QObject):
             self.show_panel()
 
     def show_panel(self):
+        if not self.panel.isVisible():
+            self.follow_height = None
         self.refresh_followed()
         if not self.recent_info:
             rooms = list(dict.fromkeys([self.room, *(item["room"] for item in self.rooms[:6] + self.favorites[:6])]))
@@ -1917,6 +1940,12 @@ class Radio(QtCore.QObject):
                   (self.anchor[1] if self.anchor else bar.top if bar else round(screen.height() * scale)) - gap)
         self.content.layout().activate()
         desired = self.content.sizeHint().height()
+        if self.cookies and self.pages.currentWidget() is self.followed.parentWidget():
+            if self.follow_height is None:
+                self.follow_height = desired
+            desired = self.follow_height
+        else:
+            self.follow_height = None
         logical_height = min(desired, max(1, int((bottom - top) / scale)))
         width, height = round(368 * scale), round(logical_height * scale)
         x = self.anchor[0] if self.anchor else round(8 * scale)

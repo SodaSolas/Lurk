@@ -59,8 +59,13 @@ def followed_live(cookies):
     data, _ = request(FOLLOWED_ENDPOINT, {"hit_ab": "false"}, cookies)
     if not isinstance(data, dict) or not ("list" in data or "rooms" in data):
         raise AccountError("关注直播接口返回了未知格式")
+    rows = data.get("list") or data.get("rooms") or []
+    if not isinstance(rows, list):
+        raise AccountError("关注直播接口返回了未知格式")
     rooms = {}
-    for item in data.get("list") or data.get("rooms") or []:
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
         room = str(item.get("room_id") or item.get("roomid") or "")
         if item.get("live_status") not in (1, "1") or not room.isascii() or not room.isdecimal():
             continue
