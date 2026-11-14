@@ -250,37 +250,52 @@ class Flyout(QtWidgets.QWidget):
     dismissed = QtCore.Signal()
 
     def __init__(self, dark):
-        super().__init__(None, QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint |
-                         QtCore.Qt.WindowStaysOnTopHint)
+        # No FramelessWindowHint: Qt makes frameless translucent windows layered, and DWM
+        # draws no system backdrop behind layered windows. nativeEvent hides the frame.
+        super().__init__(None, QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint)
         self.dark = dark
         self.acrylic = False
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self.setWindowTitle(APP_NAME)
         self.setMinimumHeight(0)
 
+    def nativeEvent(self, kind, message):
+        msg = wt.MSG.from_address(int(message))
+        if msg.message == 0x0083 and msg.wParam:  # WM_NCCALCSIZE: the whole window is client
+            return True, 0
+        if msg.message == 0x0084:  # WM_NCHITTEST: no resize edges or caption
+            return True, 1
+        return super().nativeEvent(kind, message)
+
     def apply_backdrop(self):
         hwnd = int(self.winId())
+        update_long(hwnd, -16, 0, 0x000B0000)  # drop WS_SYSMENU and the caption buttons
+        set_position(hwnd, None, 0, 0, 0, 0, 0x37)  # SWP_FRAMECHANGED, keep the rest
 
         def attribute(key, value):
             setting = ct.c_int(value)
             return dwm_set(hwnd, key, ct.byref(setting), ct.sizeof(setting)) == 0
 
-        attribute(20, int(self.dark))
-        attribute(33, 2)
+        attribute(20, int(self.dark))  # DWMWA_USE_IMMERSIVE_DARK_MODE
+        attribute(33, 2)  # DWMWA_WINDOW_CORNER_PREFERENCE: round
         margins = (ct.c_int * 4)(-1, -1, -1, -1)
-        self.acrylic = (light_theme("EnableTransparency")
-                        and dwm_extend(hwnd, ct.byref(margins)) == 0 and attribute(38, 3))
-        logging.info("DWM transient backdrop enabled: %s", self.acrylic)
+        self.acrylic = bool(light_theme("EnableTransparency")
+                            and dwm_extend(hwnd, ct.byref(margins)) == 0
+                            and attribute(38, 3))  # DWMSBT_TRANSIENTWINDOW (acrylic)
+        logging.info("DWM acrylic backdrop enabled: %s", self.acrylic)
         self.update()
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        fill = (40, 40, 40, 194) if self.dark else (250, 250, 250, 189)
-        tint = 55 if self.acrylic else fill[3]
-        painter.setBrush(QtGui.QColor(*fill[:3], tint))
-        painter.setPen(QtGui.QColor(255, 255, 255, 23) if self.dark else QtGui.QColor(0, 0, 0, 23))
-        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+        # DWM draws the rounded corners, border and shadow. Over acrylic only add a light
+        # tint; without it fall back to the solid Windows 11 flyout color.
+        if self.acrylic:
+            # Enough tint to keep text readable over dark or busy windows behind.
+            fill = QtGui.QColor(36, 36, 36, 150) if self.dark else QtGui.QColor(250, 250, 250, 175)
+        else:
+            fill = QtGui.QColor("#2c2c2c" if self.dark else "#f9f9f9")
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_Source)
+        painter.fillRect(self.rect(), fill)
 
     def event(self, event):
         if event.type() == QtCore.QEvent.WindowDeactivate:
@@ -288,41 +303,114 @@ class Flyout(QtWidgets.QWidget):
         return super().event(event)
 
 
+ROW_TEXT = QtCore.Qt.UserRole + 1  # (name, detail) shown on a room row
+
+
+def room_item(room, info, name, detail):
+    item = QtWidgets.QListWidgetItem(f"{name} · {detail}")
+    item.setData(QtCore.Qt.UserRole, (room, info))
+    item.setData(ROW_TEXT, (name, detail))
+    item.setToolTip(f"{name}\n{detail}")
+    return item
+
+
 class RoomDelegate(QtWidgets.QStyledItemDelegate):
-    def __init__(self, view, foreground, accent, selected, hover):
+    """A Fluent list row: avatar initial, name over a muted detail line."""
+
+    def __init__(self, view, colors):
         super().__init__(view)
-        self.foreground = QtGui.QColor(foreground)
-        self.accent = QtGui.QColor(accent)
-        self.selected = QtGui.QColor(selected)
-        self.hover = hover
+        self.colors = {key: QtGui.QColor(value) for key, value in colors.items()}
 
     def sizeHint(self, option, index):
-        return QtCore.QSize(0, 32)
+        return QtCore.QSize(0, 46)
 
     def paint(self, painter, option, index):
+        c = self.colors
         painter.save()
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        bounds = option.rect.adjusted(3, 1, -3, -1)
+        bounds = option.rect.adjusted(0, 1, -2, -1)
         active = bool(option.state & QtWidgets.QStyle.State_Selected)
         hovered = bool(option.state & QtWidgets.QStyle.State_MouseOver)
         painter.setPen(QtCore.Qt.NoPen)
         if active or hovered:
-            painter.setBrush(self.selected if active else self.hover)
+            painter.setBrush(c["selected"] if active else c["hover"])
             painter.drawRoundedRect(bounds, 5, 5)
         if active:
-            marker = QtCore.QRect(bounds.left() + 2, bounds.center().y() - 8, 3, 16)
-            painter.setBrush(self.accent)
-            painter.drawRoundedRect(marker, 1.5, 1.5)
-        painter.setFont(option.font)
-        painter.setPen(self.foreground)
-        text_bounds = bounds.adjusted(11, 0, -8, 0)
-        text = painter.fontMetrics().elidedText(index.data(), QtCore.Qt.ElideRight, text_bounds.width())
-        painter.drawText(text_bounds, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
+            painter.setBrush(c["accent"])
+            painter.drawRoundedRect(QtCore.QRectF(bounds.left(), bounds.center().y() - 8, 3, 16), 1.5, 1.5)
+        name, detail = index.data(ROW_TEXT) or (index.data(), "")
+        avatar = QtCore.QRect(bounds.left() + 12, bounds.center().y() - 13, 26, 26)
+        painter.setBrush(c["avatar"])
+        painter.drawEllipse(avatar)
+        painter.setPen(c["avatar_text"])
+        letter = initial(name)
+        painter.setFont(app_font(12, True) if letter else icon_font(12))
+        painter.drawText(avatar, QtCore.Qt.AlignCenter, letter or GLYPHS["music"])
+        left = avatar.right() + 11
+        width = bounds.right() - left - 8
+        for text, top, size, color in ((name, -18, 13, "fg"), (detail, 1, 11, "muted")):
+            painter.setFont(app_font(size))
+            painter.setPen(c[color])
+            painter.drawText(QtCore.QRect(left, bounds.center().y() + top, width, 17),
+                             QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+                             painter.fontMetrics().elidedText(text, QtCore.Qt.ElideRight, width))
         if option.state & QtWidgets.QStyle.State_HasFocus and option.state & QtWidgets.QStyle.State_KeyboardFocusChange:
             painter.setBrush(QtCore.Qt.NoBrush)
-            painter.setPen(self.accent)
+            painter.setPen(c["accent"])
             painter.drawRoundedRect(bounds.adjusted(0, 0, -1, -1), 5, 5)
         painter.restore()
+
+
+class SelectorBar(QtWidgets.QTabBar):
+    """Windows 11 SelectorBar: plain labels, a short accent pill under the selected one."""
+
+    def __init__(self, colors):
+        super().__init__()
+        self.colors = {key: QtGui.QColor(value) for key, value in colors.items()}
+        self.setDrawBase(False)
+        self.setExpanding(False)
+        self.setMouseTracking(True)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.hovered = -1
+
+    def tabSizeHint(self, index):
+        width = QtGui.QFontMetrics(app_font(13, True)).horizontalAdvance(self.tabText(index))
+        return QtCore.QSize(width + 28, 36)
+
+    def mouseMoveEvent(self, event):
+        hovered = self.tabAt(event.position().toPoint())
+        if hovered != self.hovered:
+            self.hovered = hovered
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.hovered = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        c = self.colors
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        for index in range(self.count()):
+            bounds = self.tabRect(index)
+            selected = index == self.currentIndex()
+            if index == self.hovered and not selected:
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(c["hover"])
+                p.drawRoundedRect(QtCore.QRectF(bounds).adjusted(2, 3, -2, -3), 5, 5)
+            p.setFont(app_font(13, selected))
+            p.setPen(c["fg"] if selected or index == self.hovered else c["muted"])
+            p.drawText(bounds.adjusted(0, 0, 0, -3), QtCore.Qt.AlignCenter, self.tabText(index))
+            if selected:
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(c["accent"])
+                p.drawRoundedRect(QtCore.QRectF(bounds.center().x() - 8, bounds.bottom() - 3, 16, 3), 1.5, 1.5)
+            if self.hasFocus() and selected:
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.setPen(c["accent"])
+                p.drawRoundedRect(QtCore.QRectF(bounds).adjusted(1, 1, -1, -1), 5, 5)
 
 
 class VolumeSlider(QtWidgets.QSlider):
@@ -339,7 +427,7 @@ class VolumeSlider(QtWidgets.QSlider):
         painter.setBrush(accent)
         painter.drawRoundedRect(QtCore.QRectF(10, y - 2, x - 10, 4), 2, 2)
         painter.setPen(accent if self.hasFocus() else self.palette().mid().color())
-        painter.setBrush(QtGui.QColor("#ffffff"))
+        painter.setBrush(self.palette().button().color())
         painter.drawEllipse(QtCore.QPointF(x, y), 9.5, 9.5)
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(accent)
@@ -423,13 +511,14 @@ class Chip(QtWidgets.QWidget):
 
         avatar = QtCore.QRect(6, 6, 28, 28)
         p.setBrush(QtGui.QColor("#1f3a5a" if dark else "#dbe8f8"))
-        glyph, ink = "♫", accent
+        glyph, ink, glyph_font = GLYPHS["music"], accent, icon_font(14)
         if state == "error":
             p.setBrush(QtGui.QColor("#433519" if dark else "#fff4ce"))
-            glyph, ink = "!", "#fce100" if dark else "#8a5300"
+            glyph, ink, glyph_font = "!", "#fce100" if dark else "#8a5300", app_font(14, True)
         elif state == "playing":
-            glyph = (info.get("uname") or "♫")[0]
-            p.setPen(QtGui.QColor(accent))
+            if initial(info.get("uname")):
+                glyph, glyph_font = initial(info.get("uname")), app_font(13, True)
+            p.setPen(QtGui.QPen(QtGui.QColor(accent), 1.5))
         if state == "loading":
             p.setBrush(QtCore.Qt.NoBrush)
             p.setPen(QtGui.QPen(QtGui.QColor(accent), 2))
@@ -437,13 +526,14 @@ class Chip(QtWidgets.QWidget):
         else:
             p.drawEllipse(avatar)
             p.setPen(QtGui.QColor(ink))
+            p.setFont(glyph_font)
             p.drawText(avatar, QtCore.Qt.AlignCenter, glyph)
 
         labels = {
-            "idle": ("B 站直播", "点一下选直播间", "▶"),
-            "loading": ("正在连接…", radio.room, "■"),
-            "playing": (info.get("uname") or radio.room, info.get("title") or "仅播放音频", "Ⅱ"),
-            "error": (radio.error or "播放失败", radio.room, "↻"),
+            "idle": ("B 站直播", "点一下选直播间", GLYPHS["play"]),
+            "loading": ("正在连接…", radio.room, GLYPHS["stop"]),
+            "playing": (info.get("uname") or radio.room, info.get("title") or "仅播放音频", GLYPHS["pause"]),
+            "error": (radio.error or "播放失败", radio.room, GLYPHS["refresh"]),
         }
         title, subtitle, action = labels[state]
         for text, y, size, color in ((title, 4, 12, fg), (subtitle, 20, 11, muted)):
@@ -459,7 +549,7 @@ class Chip(QtWidgets.QWidget):
             for i in range(3):
                 height = (8, 11, 14, 11)[(self.phase + i) % 4]
                 p.drawRoundedRect(176 + i * 5, 20 - height // 2, 3, height, 1, 1)
-        p.setFont(app_font(13, True))
+        p.setFont(icon_font(14))
         p.setPen(QtGui.QColor(fg))
         p.drawText(QtCore.QRect(198, 6, 28, 28), QtCore.Qt.AlignCenter, action)
 
@@ -470,6 +560,38 @@ def app_font(size, bold=False):
     font.setPixelSize(size)
     font.setBold(bold)
     return font
+
+
+# Segoe Fluent Icons (Windows 11), with the Windows 10 MDL2 font as fallback.
+GLYPHS = {
+    "play": "", "pause": "", "stop": "", "refresh": "",
+    "star": "", "starred": "", "go": "", "hide": "",
+    "power": "", "more": "", "volume": "", "mute": "",
+    "music": "", "open": "",
+}
+
+
+def icon_font(size):
+    font = QtGui.QFont()
+    font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
+    font.setPixelSize(size)
+    return font
+
+
+def glyph_icon(name, color, size=16):
+    pixmap = QtGui.QPixmap(size * 2, size * 2)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setFont(icon_font(size - 4))
+    painter.setPen(QtGui.QColor(color))
+    painter.drawText(QtCore.QRect(0, 0, size, size), QtCore.Qt.AlignCenter, GLYPHS[name])
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
+def initial(name):
+    return (name or "").strip()[:1].upper()
 
 
 class Radio(QtCore.QObject):
@@ -519,28 +641,56 @@ class Radio(QtCore.QObject):
     def build_panel(self):
         dark = self.panel.dark
         fg, muted, accent = ("#ffffff", "#c5c5c5", "#60cdff") if dark else ("#1b1b1b", "#5c5c5c", "#005fb8")
-        on_accent = "#151515" if dark else "#ffffff"
-        edge = "rgba(255,255,255,20)" if dark else "rgba(0,0,0,20)"
-        card = "rgba(255,255,255,15)" if dark else "rgba(255,255,255,168)"
-        hover = "rgba(255,255,255,18)" if dark else "rgba(0,0,0,12)"
+        on_accent = "#000000" if dark else "#ffffff"
+        accent_hover = "#5ab8e6" if dark else "#1a6dbf"
+        edge = "rgba(255,255,255,20)" if dark else "rgba(0,0,0,16)"
+        card = "rgba(255,255,255,13)" if dark else "rgba(255,255,255,150)"
+        field = "rgba(255,255,255,15)" if dark else "rgba(255,255,255,200)"
+        hover = "rgba(255,255,255,15)" if dark else "rgba(0,0,0,10)"
+        pressed = "rgba(255,255,255,8)" if dark else "rgba(0,0,0,6)"
+        thumb = "rgba(255,255,255,90)" if dark else "rgba(0,0,0,70)"
+        menu = "#2c2c2c" if dark else "#f9f9f9"
+        self.accent = accent
+        row_colors = {
+            "fg": fg, "muted": muted, "accent": accent,
+            "hover": "#1affffff" if dark else "#0d000000",
+            "selected": "#24ffffff" if dark else "#14000000",
+            "avatar": "#1f3a5a" if dark else "#dbe8f8",
+            "avatar_text": "#99d4ff" if dark else "#005fb8",
+        }
         self.panel.setStyleSheet(f"""
             QLabel, QLineEdit, QPushButton {{color:{fg};}}
             QLabel[muted="true"] {{color:{muted};}}
-            QFrame#now {{background:{card}; border:1px solid {edge}; border-radius:6px;}}
-            QPushButton {{background:transparent; border:1px solid transparent; border-radius:5px;}}
-            QPushButton:hover, QPushButton[current="true"] {{background:{hover};}}
+            QFrame#now {{background:{card}; border:1px solid {edge}; border-radius:8px;}}
+            QFrame#divider {{background:{edge}; border:none;}}
+            QPushButton {{background:transparent; border:1px solid transparent; border-radius:5px; padding:0 8px;}}
+            QPushButton:hover {{background:{hover};}}
+            QPushButton:pressed {{background:{pressed}; color:{muted};}}
             QPushButton:focus {{border-color:{accent};}}
             QPushButton:disabled {{color:{muted};}}
+            QPushButton[icon="true"] {{padding:0;}}
             QPushButton#transport {{background:{accent}; color:{on_accent}; border-radius:20px;}}
-            QPushButton#transport:hover {{border-color:{on_accent};}}
-            QPushButton#stop {{background:{hover}; border-radius:16px;}}
-            QPushButton#browser {{color:{accent}; text-align:left;}}
-            QLineEdit {{background:{card}; border:1px solid {edge}; border-radius:5px;
-                       border-bottom:1px solid {muted}; padding:0 8px;}}
+            QPushButton#transport:hover {{background:{accent_hover};}}
+            QPushButton#stop {{background:{hover}; border:1px solid {edge}; border-radius:16px;}}
+            QPushButton#stop:hover {{background:{field};}}
+            QPushButton#link {{color:{accent}; padding:0 6px;}}
+            QPushButton#login {{background:{accent}; color:{on_accent}; padding:0 16px;}}
+            QPushButton#login:hover {{background:{accent_hover};}}
+            QLineEdit {{background:{field}; border:1px solid {edge}; border-radius:5px;
+                       border-bottom:1px solid {muted}; padding:0 6px; selection-background-color:{accent};
+                       selection-color:{on_accent};}}
             QLineEdit:focus {{border-bottom:2px solid {accent};}}
-            QLabel#avatar {{background:{"#1f3a5a" if dark else "#dbe8f8"}; color:{accent}; border-radius:8px;}}
-            QLabel#live {{background:{"#4a2427" if dark else "#fde7e9"};
-                          color:{"#ffb3ba" if dark else "#a4262c"}; padding:2px 5px; border-radius:4px;}}
+            QLabel#avatar {{background:{row_colors["avatar"]}; color:{row_colors["avatar_text"]}; border-radius:8px;}}
+            QLabel#live {{background:{"#4a2427" if dark else "#fde7e9"}; color:{"#ffb3ba" if dark else "#a4262c"};
+                          padding:1px 7px; border-radius:9px; font-weight:600;}}
+            QListWidget {{background:transparent; border:none; outline:none;}}
+            QScrollBar:vertical {{background:transparent; width:8px; margin:2px 1px;}}
+            QScrollBar::handle:vertical {{background:{thumb}; border-radius:3px; min-height:24px;}}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{height:0;}}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{background:transparent;}}
+            QMenu {{background:{menu}; color:{fg}; border:1px solid {edge}; border-radius:8px; padding:4px;}}
+            QMenu::item {{padding:7px 28px 7px 12px; border-radius:4px;}}
+            QMenu::item:selected {{background:{hover};}}
         """)
         self.panel.setFixedWidth(368)
         self.panel.setFont(app_font(12))
@@ -557,7 +707,7 @@ class Radio(QtCore.QObject):
         outer.addWidget(scroll)
         self.content = content
         main = QtWidgets.QVBoxLayout(content)
-        main.setContentsMargins(16, 16, 16, 16)
+        main.setContentsMargins(16, 12, 16, 14)
         main.setSpacing(12)
 
         def label(text="", muted=False):
@@ -569,6 +719,7 @@ class Radio(QtCore.QObject):
         def button(text, action, name="", size=None, tip=None):
             result = QtWidgets.QPushButton(text, objectName=name)
             result.setCursor(QtCore.Qt.PointingHandCursor)
+            result.setFocusPolicy(QtCore.Qt.TabFocus)  # focus ring for keyboard use only
             if size:
                 result.setFixedSize(*size)
             if tip:
@@ -577,34 +728,52 @@ class Radio(QtCore.QObject):
             result.clicked.connect(action)
             return result
 
+        def icon_button(glyph, action, tip, size=32, glyph_size=16, name=""):
+            result = button(GLYPHS[glyph], action, name, (size, size), tip)
+            result.setFont(icon_font(glyph_size))
+            result.setProperty("icon", True)
+            return result
+
+        def divider():
+            line = QtWidgets.QFrame(objectName="divider")
+            line.setFixedHeight(1)
+            return line
+
         header = QtWidgets.QHBoxLayout()
-        header.addWidget(label("♫   " + APP_NAME, True))
+        header.setSpacing(8)
+        logo = label(GLYPHS["music"])
+        logo.setFont(icon_font(14))
+        logo.setStyleSheet(f"color:{accent};")
+        header.addWidget(logo)
+        header.addWidget(label(APP_NAME, True))
         header.addStretch()
-        header.addWidget(button("—", self.panel.hide, size=(28, 28), tip="收起"))
-        header.addWidget(button("×", self.app.quit, size=(28, 28), tip="退出"))
+        header.addWidget(icon_button("hide", self.panel.hide, "收起", glyph_size=12))
+        header.addWidget(icon_button("power", self.app.quit, "退出", glyph_size=14))
         main.addLayout(header)
 
         now = QtWidgets.QFrame(objectName="now")
         body = QtWidgets.QVBoxLayout(now)
-        body.setContentsMargins(14, 14, 14, 14)
+        body.setContentsMargins(14, 14, 14, 12)
         body.setSpacing(12)
         summary = QtWidgets.QHBoxLayout()
-        summary.setSpacing(10)
+        summary.setSpacing(12)
         self.avatar = label()
         self.avatar.setObjectName("avatar")
         self.avatar.setFixedSize(56, 56)
         self.avatar.setAlignment(QtCore.Qt.AlignCenter)
-        self.avatar.setFont(app_font(24, True))
-        summary.addWidget(self.avatar)
+        summary.addWidget(self.avatar, 0, QtCore.Qt.AlignTop)
         texts = QtWidgets.QVBoxLayout()
-        texts.setSpacing(3)
+        texts.setSpacing(2)
         category = QtWidgets.QHBoxLayout()
+        category.setSpacing(6)
         self.live = label("● 直播中")
         self.live.setObjectName("live")
+        self.live.setFont(app_font(11))
         self.area = label(muted=True)
+        self.area.setFont(app_font(11))
         category.addWidget(self.live)
         category.addWidget(self.area, 1)
-        self.favorite_button = button("☆", self.favorite_current, size=(28, 26), tip="收藏当前房间")
+        self.favorite_button = icon_button("star", self.favorite_current, "收藏当前房间", 28, 14)
         category.addWidget(self.favorite_button)
         texts.addLayout(category)
         self.title = label()
@@ -615,142 +784,143 @@ class Radio(QtCore.QObject):
         summary.addLayout(texts, 1)
         body.addLayout(summary)
         controls = QtWidgets.QHBoxLayout()
-        self.transport = button("▶", self.toggle_playback, "transport", (40, 40), "播放")
-        self.stop_control = button("■", self.stop, "stop", (32, 32), "停止")
+        controls.setSpacing(8)
+        self.transport = icon_button("play", self.toggle_playback, "播放", 40, 16, "transport")
+        self.stop_control = icon_button("stop", self.stop, "停止", 32, 12, "stop")
         controls.addWidget(self.transport)
         controls.addWidget(self.stop_control)
-        controls.addSpacing(8)
-        speaker = label("\uE767")
-        speaker.setFont(QtGui.QFont("Segoe Fluent Icons", 11))
-        controls.addWidget(speaker)
+        controls.addSpacing(6)
+        self.speaker = label(GLYPHS["mute" if self.volume == 0 else "volume"])
+        self.speaker.setFont(icon_font(16))
+        controls.addWidget(self.speaker)
         slider = VolumeSlider(QtCore.Qt.Horizontal)
         slider.setRange(0, 100)
-        slider.setFixedHeight(24)
+        slider.setFixedHeight(28)
         palette = slider.palette()
         palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(accent))
-        palette.setColor(QtGui.QPalette.Mid, QtGui.QColor("#777777" if dark else "#aaaaaa"))
+        palette.setColor(QtGui.QPalette.Mid, QtGui.QColor("#8b8b8b" if dark else "#8a8a8a"))
+        palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#454545" if dark else "#ffffff"))
         slider.setPalette(palette)
         slider.setAccessibleName("音量")
         slider.setValue(self.volume)
         slider.valueChanged.connect(self.change_volume)
         controls.addWidget(slider, 1)
-        self.volume_label = label(f"{self.volume}%", True)
-        self.volume_label.setFixedWidth(33)
+        self.volume_label = label(f"{self.volume}", True)
+        self.volume_label.setFixedWidth(26)
         self.volume_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         controls.addWidget(self.volume_label)
         body.addLayout(controls)
         main.addWidget(now)
 
-        switch = QtWidgets.QVBoxLayout()
-        switch.setSpacing(5)
-        switch.addWidget(label("切换直播间", True))
-        entry = QtWidgets.QHBoxLayout()
-        self.input = QtWidgets.QLineEdit(placeholderText="房间号、直播链接或 b23.tv 短链")
-        self.input.setAccessibleName("切换直播间")
-        self.input.setFixedHeight(32)
-        self.input.returnPressed.connect(self.play_input)
-        entry.addWidget(self.input, 1)
-        entry.addWidget(button("→", self.play_input, size=(32, 32), tip="播放这个房间"))
-        switch.addLayout(entry)
-        tabs = QtWidgets.QTabBar()
-        tabs.setExpanding(True)
-        tabs.setStyleSheet(f"""
-            QTabBar::tab {{color:{muted}; padding:7px 14px; border-bottom:2px solid transparent;}}
-            QTabBar::tab:hover {{background:{hover};}}
-            QTabBar::tab:selected {{color:{fg}; border-bottom-color:{accent};}}
-        """)
+        tabs = SelectorBar({"fg": fg, "muted": muted, "accent": accent, "hover": row_colors["hover"]})
         pages = QtWidgets.QStackedWidget()
         follow_page = QtWidgets.QWidget()
         follow_layout = QtWidgets.QVBoxLayout(follow_page)
         follow_layout.setContentsMargins(0, 0, 0, 0)
-        follow_layout.setSpacing(5)
+        follow_layout.setSpacing(6)
         tabs.addTab("关注")
         pages.addWidget(follow_page)
         self.room_views = []
         self.saved_counts = []
-        for title, hint in (("收藏", "暂无收藏，可点上方 ☆ 或右键房间"),
-                            ("历史", "暂无播放历史")):
+        for title, hint in (("收藏", "还没有收藏。点上方的星标，或右键房间收藏"),
+                            ("历史", "还没有播放记录")):
             tabs.addTab(title)
             page = QtWidgets.QWidget()
             layout = QtWidgets.QVBoxLayout(page)
             layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(5)
+            layout.setSpacing(6)
             count = label(hint, True)
             count.setFixedHeight(24)
             layout.addWidget(count)
             view = QtWidgets.QListWidget()
             view.setAccessibleName(title)
-            layout.addWidget(view)
-            layout.addStretch()
+            layout.addWidget(view, 1)
             pages.addWidget(page)
             self.room_views.append(view)
             self.saved_counts.append((count, hint))
         tabs.currentChanged.connect(pages.setCurrentIndex)
         main.addWidget(tabs)
-        main.addWidget(pages)
+        main.addWidget(pages, 1)
 
         followed_header = QtWidgets.QHBoxLayout()
-        followed_header.addWidget(label("正在开播", True))
-        followed_header.addStretch()
-        self.account_refresh = button("刷新", self.refresh_followed)
-        followed_header.addWidget(self.account_refresh)
-        self.account_action = button("", self.toggle_account)
-        followed_header.addWidget(self.account_action)
-        follow_layout.addLayout(followed_header)
+        followed_header.setSpacing(4)
         self.account_status = label(muted=True)
         self.account_status.setWordWrap(True)
-        follow_layout.addWidget(self.account_status)
+        followed_header.addWidget(self.account_status, 1)
+        self.account_refresh = icon_button("refresh", self.refresh_followed, "刷新", 28, 13)
+        followed_header.addWidget(self.account_refresh)
+        self.account_more = icon_button("more", self.account_menu, "更多", 28, 14)
+        followed_header.addWidget(self.account_more)
+        follow_layout.addLayout(followed_header)
+        self.account_action = button("", self.toggle_account, "login")
+        self.account_action.setFixedHeight(32)
+        follow_layout.addWidget(self.account_action, 0, QtCore.Qt.AlignLeft)
         self.account_qr = label()
         self.account_qr.setAlignment(QtCore.Qt.AlignCenter)
         self.account_qr.hide()
         follow_layout.addWidget(self.account_qr)
         self.followed = QtWidgets.QListWidget()
-        selected = "#24465a" if dark else "#dcecf9"
         for view in [self.followed, *self.room_views]:
-            view.setStyleSheet(
-                f"QListWidget {{background:{card}; color:{fg}; border:1px solid {edge};"
-                f" border-radius:6px; outline:none;}}"
-            )
-            view.setItemDelegate(RoomDelegate(
-                view, fg, accent, selected,
-                QtGui.QColor(255, 255, 255, 18) if dark else QtGui.QColor(0, 0, 0, 12),
-            ))
+            view.setItemDelegate(RoomDelegate(view, row_colors))
             view.setMouseTracking(True)
             view.setUniformItemSizes(True)
             view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-            view.setFixedHeight(162)
+            view.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+            view.setMinimumHeight(3 * 46)
             view.itemClicked.connect(self.play_list_room)
             view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             view.customContextMenuRequested.connect(lambda point, target=view: self.room_menu(target, point))
         self.followed.setAccessibleName("正在开播的关注")
         self.followed.setVisible(bool(self.cookies))
-        follow_layout.addWidget(self.followed)
-        follow_layout.addStretch()
+        follow_layout.addWidget(self.followed, 1)
         self.update_account_controls()
-        self.account_status.setText("刷新可查看关注直播" if self.cookies else "扫码登录后查看")
-        line = QtWidgets.QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet(f"background:{edge};")
-        main.addWidget(line)
+        self.account_status.setText("点刷新查看正在开播的关注" if self.cookies else
+                                    "登录后可以看到关注中正在开播的主播")
+
+        self.input = QtWidgets.QLineEdit(placeholderText="输入房间号、直播链接或 b23.tv 短链")
+        self.input.setAccessibleName("切换直播间")
+        self.input.setFixedHeight(34)
+        go = self.input.addAction(glyph_icon("go", fg), QtWidgets.QLineEdit.TrailingPosition)
+        go.setToolTip("播放这个房间")
+        go.triggered.connect(self.play_input)
+        self.input.returnPressed.connect(self.play_input)
+        main.addWidget(self.input)
+
+        main.addWidget(divider())
         footer = QtWidgets.QHBoxLayout()
-        footer.addWidget(button("在浏览器中打开 ↗", self.open_room, "browser"))
+        browser = button("在浏览器中打开", self.open_room, "link")
+        browser.setIcon(glyph_icon("open", accent, 14))
+        browser.setLayoutDirection(QtCore.Qt.RightToLeft)
+        browser.setFixedHeight(28)
+        footer.addWidget(browser)
         footer.addStretch()
         self.status = label(muted=True)
         footer.addWidget(self.status)
         main.addLayout(footer)
-        main.addLayout(switch)
         escape = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self.panel)
         escape.activated.connect(self.panel.hide)
         self.update_display()
+
+    def account_menu(self):
+        menu = QtWidgets.QMenu(self.panel)
+        sign_out = menu.addAction("退出登录")
+        self.room_menu_open = True
+        try:
+            point = self.account_more.mapToGlobal(QtCore.QPoint(0, self.account_more.height()))
+            if menu.exec(point) == sign_out and self.cookies:
+                self.toggle_account()
+        finally:
+            self.room_menu_open = False
 
     def update_account_controls(self):
         busy = self.account_task is not None
         self.followed.setVisible(bool(self.cookies))
         self.account_refresh.setVisible(bool(self.cookies))
         self.account_refresh.setEnabled(not busy)
-        self.account_action.setText("退出登录" if self.cookies else
-                                    "取消登录" if self.qr_key else "扫码登录")
-        self.account_action.setEnabled(not busy or bool(self.cookies or self.qr_key))
+        self.account_more.setVisible(bool(self.cookies))
+        self.account_action.setVisible(not self.cookies)
+        self.account_action.setText("取消登录" if self.qr_key else "扫码登录")
+        self.account_action.setEnabled(not busy or bool(self.qr_key))
 
     def account_request(self, action, function, *args):
         self.account_task = action, self.network_pool.submit(function, *args)
@@ -833,9 +1003,8 @@ class Radio(QtCore.QObject):
                 else:
                     self.followed.clear()
                     for room, info in result.items():
-                        item = QtWidgets.QListWidgetItem(f"{info['uname']}  ·  {info['title'] or room}")
-                        item.setData(QtCore.Qt.UserRole, (room, info))
-                        self.followed.addItem(item)
+                        self.followed.addItem(room_item(room, info, info["uname"],
+                                                        info["title"] or f"房间 {room}"))
                     self.sync_room_selection()
                     self.account_status.setText(f"{len(result)} 个房间正在直播" if result else
                                                 "关注的主播暂时没有开播")
@@ -915,14 +1084,16 @@ class Radio(QtCore.QObject):
     def update_display(self):
         info = self.details()
         name = info.get("uname") or ""
-        self.avatar.setText(name[:1] or "♫")
+        self.avatar.setFont(app_font(24, True) if initial(name) else icon_font(24))
+        self.avatar.setText(initial(name) or GLYPHS["music"])
         self.live.setVisible(info.get("live_status") == 1 or self.state == "playing")
         areas = dict.fromkeys(filter(None, (info.get("parent_area_name"), info.get("area_name"))))
         self.elide(self.area, " · ".join(areas), 140)
         self.elide(self.title, info.get("title") or f"房间 {self.room}", 226)
         self.elide(self.byline, f"{name} · 房间 {self.room}" if name else f"房间 {self.room}", 226)
         active = self.state in ("playing", "loading")
-        self.transport.setText({"playing": "Ⅱ", "loading": "■", "error": "↻"}.get(self.state, "▶"))
+        self.transport.setText(GLYPHS[{"playing": "pause", "loading": "stop",
+                                       "error": "refresh"}.get(self.state, "play")])
         self.transport.setAccessibleName("停止" if active else "播放")
         self.stop_control.setEnabled(active)
         status = {"idle": "待播放", "playing": "已连接 · 仅播放音频",
@@ -931,7 +1102,8 @@ class Radio(QtCore.QObject):
         if hasattr(self, "chip"):
             self.chip.refresh()
         favorite = self.is_favorite(self.room)
-        self.favorite_button.setText("★" if favorite else "☆")
+        self.favorite_button.setText(GLYPHS["starred" if favorite else "star"])
+        self.favorite_button.setStyleSheet(f"color:{self.accent};" if favorite else "")
         favorite_label = "取消收藏" if favorite else "收藏当前房间"
         self.favorite_button.setToolTip(favorite_label)
         self.favorite_button.setAccessibleName(favorite_label)
@@ -948,10 +1120,7 @@ class Radio(QtCore.QObject):
                 room = record["room"]
                 info = self.info.get(room, {})
                 name = info.get("uname") or record["name"] or f"房间 {room}"
-                detail = info.get("title") or room
-                item = QtWidgets.QListWidgetItem(f"{name}  ·  {detail}")
-                item.setData(QtCore.Qt.UserRole, (room, info))
-                view.addItem(item)
+                view.addItem(room_item(room, info, name, info.get("title") or f"房间 {room}"))
             view.verticalScrollBar().setValue(scroll)
             count.setText(f"{len(records)} 个房间" if records else hint)
 
@@ -968,7 +1137,8 @@ class Radio(QtCore.QObject):
 
     def change_volume(self, value):
         self.volume = value
-        self.volume_label.setText(f"{value}%")
+        self.volume_label.setText(f"{value}")
+        self.speaker.setText(GLYPHS["mute" if value == 0 else "volume"])
         self.save_timer.start()
 
     def open_room(self):
