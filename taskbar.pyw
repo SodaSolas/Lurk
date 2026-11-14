@@ -23,7 +23,7 @@ from listen import (DEFAULT_ROOM, PLAYER, player_command, resolve_room, room_num
                     short_link, stream_command)
 
 
-APP_NAME = "B 站直播电台"
+APP_NAME = "黑听"
 STATE_DIR = Path(os.environ["LOCALAPPDATA"]) / "BiliLiveAudio"
 USER = ct.WinDLL("user32", use_last_error=True)
 KERNEL = ct.WinDLL("kernel32", use_last_error=True)
@@ -146,8 +146,8 @@ def theme_text(dark, follow_accent=True):
 
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_NAME = "BiliLiveAudio"
-LAUNCHER = Path(__file__).resolve().with_name("Bili Live Audio.exe")
+RUN_NAME = "BiliLiveAudio"  # internal names keep the old identifier so settings carry over
+LAUNCHER = Path(__file__).resolve().with_name("Lurk.exe")
 
 
 def autostart_enabled():
@@ -947,6 +947,11 @@ class Radio(QtCore.QObject):
         self.build_panel()
         self.chip = Chip(self)
         self.chip.winId()
+        if autostart_enabled():
+            try:
+                set_autostart(True)  # point an older entry at the current launcher
+            except OSError:
+                logging.warning("Cannot refresh the autostart entry")
         self.timer = QtCore.QTimer(self, interval=120)
         self.timer.timeout.connect(self.tick)
         self.timer.start()

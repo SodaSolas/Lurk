@@ -28,7 +28,7 @@ internal static class Launcher
         }
         catch (Exception error)
         {
-            MessageBox.Show(error.Message, "B 站直播电台", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(error.Message, "黑听", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 }

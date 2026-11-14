@@ -1,4 +1,6 @@
-# B 站直播后台听
+# 黑听（Lurk）
+
+B 站直播后台听：不开浏览器、不看画面，挂在任务栏上「黑听」。
 
 参考 [FluentFlyout](https://github.com/unchihugo/FluentFlyout) 的任务栏媒体组件，做一个嵌入 Windows 11 任务栏的 B 站直播音频小工具。平时只想听直播时，可以完全退出 Chrome。
 
@@ -8,7 +10,7 @@
 - 展开面板后可用哔哩哔哩 App 扫码登录，查看关注中正在开播的主播。点房间直接收听，重新展开或点「刷新」更新列表。凭据用 Windows DPAPI 加密保存在当前 Windows 用户下，「退出登录」会清除本机凭据。
 - 面板包含「关注」「收藏」「历史」「设置」四个图标页签。用当前房间的星标或列表右键菜单收藏，收藏保存在本机。历史保留最近成功播放过的 50 个房间。房间号和链接输入在面板底部。
 - 「设置」页的开关：
-  - 开机自动启动：写入当前用户的 `Run` 注册表项，启动 `Bili Live Audio.exe`。默认关闭。
+  - 开机自动启动：写入当前用户的 `Run` 注册表项，启动 `Lurk.exe`。默认关闭。旧版本留下的启动项会在程序启动时改指向新的启动器。
   - 断线自动重连：播放中断后间隔 2、4、8、15、30 秒最多重试 5 次；重连时发现未开播就停止，显示「直播已结束」。默认开启。
   - 媒体键控制：接入 Windows 系统媒体控制，键盘媒体键和系统音量浮窗显示主播名、标题和头像，可播放和停止。直播无法暂停，暂停等同停止。默认开启。
   - 滚轮调音量：在任务栏小组件上滚动，每格 5，小组件第二行短暂显示音量。默认开启。
@@ -32,12 +34,12 @@
 
 ## 启动任务栏组件
 
-双击本目录的 `Bili Live Audio.exe`。可以给它创建快捷方式，EXE 本体需要留在项目目录以找到 `.venv` 和程序文件。首次打开默认房间为 `21292831`，点击播放按钮开始。收起面板后，点任务栏上的小组件（显示主播名和播放状态）即可打开，点小组件右侧按钮直接播放或停止。点击列表里的房间会直接切换播放。用面板右上角的退出按钮关闭组件和播放器。新环境需要在 `.venv` 中安装 `PySide6`、`streamlink`、`requests`、`qrcode`，以及系统媒体控制用的 `winrt-runtime`、`winrt-Windows.Media`、`winrt-Windows.Media.Playback`、`winrt-Windows.Foundation` 和 `winrt-Windows.Storage.Streams`。缺少 winrt 包时其他功能照常，只是媒体键不可用。原有的 VBS 启动器仍可使用。
+双击本目录的 `Lurk.exe`（或快捷方式 `黑听.lnk`）。可以给它创建快捷方式，EXE 本体需要留在项目目录以找到 `.venv` 和程序文件。首次打开默认房间为 `21292831`，点击播放按钮开始。收起面板后，点任务栏上的小组件（显示主播名和播放状态）即可打开，点小组件右侧按钮直接播放或停止。点击列表里的房间会直接切换播放。用面板右上角的退出按钮关闭组件和播放器。新环境需要在 `.venv` 中安装 `PySide6`、`streamlink`、`requests`、`qrcode`，以及系统媒体控制用的 `winrt-runtime`、`winrt-Windows.Media`、`winrt-Windows.Media.Playback`、`winrt-Windows.Foundation` 和 `winrt-Windows.Storage.Streams`。缺少 winrt 包时其他功能照常，只是媒体键不可用。VBS 启动器 `Start Lurk.vbs` 仍可使用。设置、收藏和登录仍保存在 `%LOCALAPPDATA%\BiliLiveAudio`，改名前的数据照常读取。
 
 可在本目录用 PowerShell 重新编译 EXE 启动器。
 
 ```powershell
-& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /reference:System.Windows.Forms.dll '/out:Bili Live Audio.exe' Launcher.cs
+& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /codepage:65001 /reference:System.Windows.Forms.dll /out:Lurk.exe Launcher.cs
 ```
 
 - 2026-11-15，用房间 `21292831` 实测任务栏嵌入、弹出面板、音频输出、音量调节、最近房间和停止后的进程清理。
