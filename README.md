@@ -4,6 +4,10 @@ B 站直播后台听：不开浏览器、不看画面，挂在 Windows 11 任务
 
 参考 [FluentFlyout](https://github.com/unchihugo/FluentFlyout) 的任务栏媒体组件，把 B 站直播的声音放进任务栏。只想听直播的时候，可以完全关掉浏览器。
 
+[![黑听 15 秒演示](docs/promo.jpg)](https://www.bilibili.com/video/BV1eXsj6MEiR/)
+
+点击图片在 B 站观看 15 秒演示。视频里的界面是照着软件重画的，主播和弹幕都是虚构的。
+
 ## 功能
 
 - 任务栏小组件显示主播名和播放状态，右侧按钮直接播放或停止。全屏应用和任务栏自动隐藏时，它跟任务栏一起隐藏。
@@ -27,7 +31,13 @@ B 站直播后台听：不开浏览器、不看画面，挂在 Windows 11 任务
 
 需要 Windows 11 和 Python 3.12。
 
-1. 克隆本仓库，在目录里创建虚拟环境并安装依赖：
+### 下载发行版
+
+从 [Releases](https://github.com/SodaSolas/Lurk/releases/latest) 下载 `Lurk-v版本号-windows.zip` 并解压。包里已经有编译好的 `Lurk.exe`，按下面第 1、2 步装好依赖和 mpv 就能用，不需要第 3 步。
+
+### 从源码安装
+
+1. 克隆本仓库（用发行版的话，进入解压后的目录），在目录里创建虚拟环境并安装依赖：
 
    ```powershell
    py -3.12 -m venv .venv
