@@ -160,9 +160,18 @@ def autostart_enabled():
 
 
 def set_autostart(enabled):
+    if enabled:
+        if LAUNCHER.is_file():
+            command = f'"{LAUNCHER}"'
+        else:
+            app = Path(__file__).resolve()
+            python = app.parent / ".venv" / "Scripts" / "pythonw.exe"
+            if not python.is_file():
+                raise FileNotFoundError(python)
+            command = f'"{python}" "{app}"'
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as run:
         if enabled:
-            winreg.SetValueEx(run, RUN_NAME, 0, winreg.REG_SZ, f'"{LAUNCHER}"')
+            winreg.SetValueEx(run, RUN_NAME, 0, winreg.REG_SZ, command)
         else:
             try:
                 winreg.DeleteValue(run, RUN_NAME)
@@ -192,8 +201,11 @@ def load_state():
         saved = data.get("options")
         options = {key: bool(saved.get(key, value)) if isinstance(saved, dict) else value
                    for key, value in OPTIONS.items()}
-        return (saved_rooms(data.get("rooms")), saved_rooms(data.get("favorites")),
-                max(0, min(100, int(data.get("volume", 60)))), options)
+        try:
+            volume = max(0, min(100, int(data.get("volume", 60))))
+        except (ValueError, TypeError, OverflowError):
+            volume = 60
+        return saved_rooms(data.get("rooms")), saved_rooms(data.get("favorites")), volume, options
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return [], [], 60, dict(OPTIONS)
 
@@ -1652,7 +1664,7 @@ class Radio(QtCore.QObject):
             self.notify("无法打开默认浏览器")
 
     def play_input(self):
-        value = self.input.text()
+        submitted_input = value = self.input.text()
         if not value.strip():
             self.input.setFocus()
             return
@@ -1662,15 +1674,15 @@ class Radio(QtCore.QObject):
             except ValueError as error:
                 self.notify(str(error))
                 return
-        self.start(value)
+        self.start(value, submitted_input=submitted_input)
 
-    def start(self, value, retry=False):
+    def start(self, value, retry=False, submitted_input=None):
         self.notice = ""
         self.stop(retry=retry)
         self.room = value if not short_link(value) else self.room
         self.state = "loading"
         self.update_display()
-        self.starting = (self.request, self.network_pool.submit(resolve_room, value))
+        self.starting = (self.request, self.network_pool.submit(resolve_room, value), submitted_input)
 
     def toggle_playback(self):
         if self.state in ("loading", "playing"):
@@ -1707,7 +1719,7 @@ class Radio(QtCore.QObject):
 
     def check_playback(self):
         if self.starting and self.starting[1].done():
-            request, future = self.starting
+            request, future, submitted_input = self.starting
             self.starting = None
             if request == self.request:
                 try:
@@ -1717,7 +1729,8 @@ class Radio(QtCore.QObject):
                 except ValueError as error:
                     self.fail(str(error))
                 else:
-                    self.input.clear()
+                    if submitted_input is not None and self.input.text() == submitted_input:
+                        self.input.clear()
                     self.update_display()
                     launching = self.player_pool.submit(Playback, self.room, self.volume)
                     launching.add_done_callback(lambda f, token=request: self.launched.emit(token, f))

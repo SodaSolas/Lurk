@@ -82,7 +82,13 @@ def main():
         playback = subprocess.Popen(player_command(), stdin=stream.stdout)
         stream.stdout.close()
         player_status = playback.wait()
-        return player_status or (stream.poll() or 0)
+        if player_status:
+            return player_status
+        try:
+            return stream.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            print("mpv exited while Streamlink was still running.", file=sys.stderr)
+            return 1
     except KeyboardInterrupt:
         return 130
     finally:
