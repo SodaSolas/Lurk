@@ -120,6 +120,55 @@ def light_theme(value="SystemUsesLightTheme"):
         return False
 
 
+def system_accent(dark):
+    """The Windows accent shade Fluent uses for this theme, or None if unavailable.
+    AccentPalette holds eight RGBA colors: light 3..1, the accent itself, dark 1..3."""
+    try:
+        key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as settings:
+            data = winreg.QueryValueEx(settings, "AccentPalette")[0]
+        index = 1 if dark else 4  # AccentLight2 on dark, AccentDark1 on light
+        red, green, blue = data[index * 4:index * 4 + 3]
+        return f"#{red:02x}{green:02x}{blue:02x}"
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def theme_text(dark, follow_accent=True):
+    """Foreground, secondary and accent colors for a light or dark surface."""
+    fg, muted, accent = ("#ffffff", "#c5c5c5", "#60cdff") if dark else ("#1b1b1b", "#5c5c5c", "#005fb8")
+    return fg, muted, (follow_accent and system_accent(dark)) or accent
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "BiliLiveAudio"
+LAUNCHER = Path(__file__).resolve().with_name("Bili Live Audio.exe")
+
+
+def autostart_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as run:
+            winreg.QueryValueEx(run, RUN_NAME)
+        return True
+    except OSError:
+        return False
+
+
+def set_autostart(enabled):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as run:
+        if enabled:
+            winreg.SetValueEx(run, RUN_NAME, 0, winreg.REG_SZ, f'"{LAUNCHER}"')
+        else:
+            try:
+                winreg.DeleteValue(run, RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+
+OPTIONS = {"reconnect": True, "media_keys": True, "wheel_volume": True,
+           "avatar": True, "system_accent": True}
+
+
 def saved_rooms(items):
     rooms = {}
     for item in items if isinstance(items, list) else []:
@@ -135,10 +184,41 @@ def saved_rooms(items):
 def load_state():
     try:
         data = json.loads((STATE_DIR / "settings.json").read_text(encoding="utf-8"))
+        saved = data.get("options")
+        options = {key: bool(saved.get(key, value)) if isinstance(saved, dict) else value
+                   for key, value in OPTIONS.items()}
         return (saved_rooms(data.get("rooms")), saved_rooms(data.get("favorites")),
-                max(0, min(100, int(data.get("volume", 60)))))
+                max(0, min(100, int(data.get("volume", 60)))), options)
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        return [], [], 60
+        return [], [], 60, dict(OPTIONS)
+
+
+def web_get(url, timeout=5):
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://live.bilibili.com/"})
+    with urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def fetch_face(uid):
+    """Return (url, image bytes) for a streamer's avatar, cached for a week."""
+    cache = STATE_DIR / "faces"
+    image, link = cache / f"{uid}.img", cache / f"{uid}.url"
+    try:
+        if image.exists() and time.time() - image.stat().st_mtime < 7 * 86400:
+            return link.read_text(encoding="utf-8"), image.read_bytes()
+    except OSError:
+        pass
+    try:
+        data = json.loads(web_get(f"https://api.live.bilibili.com/live_user/v1/Master/info?uid={int(uid)}"))
+        url = data["data"]["info"]["face"].replace("http://", "https://", 1)
+        content = web_get(url, 10)
+        cache.mkdir(exist_ok=True)
+        image.write_bytes(content)
+        link.write_text(url, encoding="utf-8")
+        return url, content
+    except (OSError, ValueError, TypeError, KeyError):
+        logging.debug("Avatar unavailable for %s", uid, exc_info=True)
+        return None, None
 
 
 def room_info(rooms):
@@ -245,6 +325,70 @@ class Playback:
             return "直播间未开播或没有可用直播流"
         logging.warning("Playback failed for %s: %s", self.room, errors[-500:])
         return "无法播放，请检查直播间和网络"
+
+
+class MediaControls(QtCore.QObject):
+    """Windows system media controls: media keys and the volume flyout's media card.
+    A MediaPlayer with its command manager off gives a desktop app its own session
+    without a window handle; mpv still plays the audio."""
+
+    pressed = QtCore.Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.player = self.controls = self.token = None
+        self.shown = None
+
+    def enable(self, enabled):
+        if enabled and not self.player:
+            try:
+                from winrt.windows.media.playback import MediaPlayer
+                from winrt.windows.media import MediaPlaybackType
+                self.player = MediaPlayer()
+                self.player.command_manager.is_enabled = False
+                controls = self.player.system_media_transport_controls
+                controls.is_play_enabled = controls.is_pause_enabled = controls.is_stop_enabled = True
+                controls.display_updater.type = MediaPlaybackType.MUSIC
+                controls.is_enabled = True
+                self.token = controls.add_button_pressed(self.button_pressed)
+                self.controls = controls
+            except Exception:
+                logging.exception("System media controls unavailable")
+                self.player = self.controls = None
+        elif not enabled and self.player:
+            try:
+                self.controls.remove_button_pressed(self.token)
+                self.controls.is_enabled = False
+                self.controls.display_updater.clear_all()
+                self.player.close()
+            except Exception:
+                logging.debug("Closing system media controls", exc_info=True)
+            self.player = self.controls = self.token = None
+        self.shown = None
+        return self.player is not None
+
+    def button_pressed(self, sender, args):
+        # Called on a WinRT worker thread; the queued signal hands it to the UI thread.
+        self.pressed.emit({0: "play", 1: "pause", 2: "stop"}.get(int(args.button), ""))
+
+    def show(self, state, title, artist, thumbnail):
+        if not self.controls or self.shown == (state, title, artist, thumbnail):
+            return
+        self.shown = state, title, artist, thumbnail
+        try:
+            from winrt.windows.media import MediaPlaybackStatus
+            from winrt.windows.foundation import Uri
+            from winrt.windows.storage.streams import RandomAccessStreamReference
+            updater = self.controls.display_updater
+            updater.music_properties.title = title
+            updater.music_properties.artist = artist
+            updater.thumbnail = RandomAccessStreamReference.create_from_uri(Uri(thumbnail)) if thumbnail else None
+            updater.update()
+            self.controls.playback_status = {
+                "loading": MediaPlaybackStatus.CHANGING, "playing": MediaPlaybackStatus.PLAYING,
+            }.get(state, MediaPlaybackStatus.STOPPED)
+        except Exception:
+            logging.exception("Updating system media controls")
 
 
 class Flyout(QtWidgets.QWidget):
@@ -395,6 +539,7 @@ class SelectorBar(QtWidgets.QTabBar):
     def __init__(self):
         super().__init__()
         self.colors = {}  # set by Radio.apply_theme
+        self.active = True  # False while a page outside the tabs (settings) is shown
         self.setDrawBase(False)
         self.setExpanding(False)
         self.setMouseTracking(True)
@@ -427,7 +572,7 @@ class SelectorBar(QtWidgets.QTabBar):
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         for index in range(self.count()):
             bounds = self.tabRect(index)
-            selected = index == self.currentIndex()
+            selected = index == self.currentIndex() and self.active
             if index == self.hovered and not selected:
                 p.setPen(QtCore.Qt.NoPen)
                 p.setBrush(c["hover"])
@@ -477,6 +622,99 @@ class VolumeSlider(QtWidgets.QSlider):
             self.setValue(round(100 * (event.position().x() - 10) / max(1, self.width() - 20)))
 
 
+class ToggleSwitch(QtWidgets.QAbstractButton):
+    """Windows 11 ToggleSwitch: an outlined pill when off, an accent pill when on."""
+
+    def __init__(self):
+        super().__init__()
+        self.setCheckable(True)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.TabFocus)
+        self.setFixedSize(40, 20)
+        self.colors = {}  # set by Radio.apply_theme
+
+    def paintEvent(self, event):
+        c = self.colors
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        track = QtCore.QRectF(0.5, 0.5, 39, 19)
+        if self.isChecked():
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(c["accent"])
+        else:
+            p.setPen(QtGui.QPen(c["muted"], 1))
+            p.setBrush(QtCore.Qt.NoBrush)
+        p.drawRoundedRect(track, 9.5, 9.5)
+        radius = 6 if self.underMouse() else 5
+        x = 30 if self.isChecked() else 10
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c["on_accent"] if self.isChecked() else c["muted"])
+        p.drawEllipse(QtCore.QPointF(x, 10), radius, radius)
+        if self.hasFocus():
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.setPen(QtGui.QPen(c["fg"], 1))
+            p.drawRoundedRect(QtCore.QRectF(0.5, 0.5, 39, 19), 9.5, 9.5)
+
+    def enterEvent(self, event):
+        self.update()
+
+    def leaveEvent(self, event):
+        self.update()
+
+
+class LiveBadge(QtWidgets.QWidget):
+    """The red "live" pill. Painted so the dot is centered geometrically; a text
+    bullet sits on the font baseline and looks low next to CJK glyphs."""
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        self.colors = {}  # set by Radio.apply_theme
+        self.setFont(app_font(11, True))
+        self.setFixedSize(18 + self.fontMetrics().horizontalAdvance(text) + 9, 20)  # dot area, text, end padding
+        self.setAccessibleName(text)
+
+    def paintEvent(self, event):
+        c = self.colors
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c["background"])
+        p.drawRoundedRect(QtCore.QRectF(self.rect()), 10, 10)
+        p.setBrush(c["dot"])
+        p.drawEllipse(QtCore.QPointF(11, self.height() / 2), 3, 3)
+        p.setPen(c["text"])
+        p.drawText(self.rect().adjusted(18, 0, 0, 0), QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, self.text)
+
+
+class SettingRow(QtWidgets.QWidget):
+    """A settings line: title and hint on the left, a switch on the right.
+    Clicking anywhere on the row flips the switch."""
+
+    def __init__(self, title, hint):
+        super().__init__()
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(12)
+        texts = QtWidgets.QVBoxLayout()
+        texts.setSpacing(1)
+        name = QtWidgets.QLabel(title)
+        name.setFont(app_font(13))
+        texts.addWidget(name)
+        detail = ElidedLabel(hint, muted=True)
+        detail.setFont(app_font(11))
+        texts.addWidget(detail)
+        layout.addLayout(texts, 1)
+        self.switch = ToggleSwitch()
+        self.switch.setAccessibleName(title)
+        layout.addWidget(self.switch, 0, QtCore.Qt.AlignVCenter)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.switch.click()
+
+
 class Chip(QtWidgets.QWidget):
     def __init__(self, radio):
         super().__init__(None, QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint |
@@ -492,6 +730,22 @@ class Chip(QtWidgets.QWidget):
         self.phase = 0
         self.animation = QtCore.QTimer(self, interval=110)
         self.animation.timeout.connect(self.animate)
+        self.volume_hint = False  # briefly show the volume after a wheel scroll
+        self.hint_timer = QtCore.QTimer(self, interval=1200, singleShot=True)
+        self.hint_timer.timeout.connect(self.end_volume_hint)
+
+    def end_volume_hint(self):
+        self.volume_hint = False
+        self.redraw()
+
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120
+        if not self.radio.options["wheel_volume"] or not steps:
+            return
+        self.radio.slider.setValue(max(0, min(100, self.radio.volume + round(steps * 5))))
+        self.volume_hint = True
+        self.hint_timer.start()
+        self.redraw()
 
     def redraw(self):
         """Paint now. Embedded in Explorer's taskbar, the widget never gets Qt's expose
@@ -536,7 +790,7 @@ class Chip(QtWidgets.QWidget):
         state = radio.state
         info = radio.details()
         dark = self.dark
-        fg, muted, accent = ("#ffffff", "#c5c5c5", "#60cdff") if dark else ("#1b1b1b", "#5c5c5c", "#005fb8")
+        fg, muted, accent = theme_text(dark, radio.options["system_accent"])
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         p.setPen(QtCore.Qt.NoPen)
@@ -571,10 +825,12 @@ class Chip(QtWidgets.QWidget):
         name = info.get("uname") or f"房间 {radio.room}"
         detail = {
             "idle": "未播放",
-            "loading": "连接中…",
+            "loading": radio.connecting_text(),
             "playing": info.get("title") or "播放中",
             "error": radio.error or "播放失败",
         }[state]
+        if self.volume_hint:
+            detail = f"音量 {radio.volume}"
         action = GLYPHS[{"idle": "play", "loading": "stop", "playing": "pause", "error": "refresh"}[state]]
         width = 158
         for text, y, size, color in ((name, 4, 12, fg), (detail, 20, 11, muted)):
@@ -601,7 +857,7 @@ GLYPHS = {
     "star": "", "starred": "", "go": "", "hide": "",
     "power": "", "more": "", "volume": "", "mute": "",
     "music": "", "open": "", "people": "", "history": "",
-    "warning": "",
+    "warning": "", "settings": "",
 }
 
 
@@ -632,7 +888,15 @@ class Radio(QtCore.QObject):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.rooms, self.favorites, self.volume = load_state()
+        self.rooms, self.favorites, self.volume, self.options = load_state()
+        self.notice = ""  # footer message, e.g. a setting that could not be applied
+        self.retries = 0  # reconnect attempts since playback last dropped
+        self.retry_at = 0
+        self.faces = {}  # uid -> (url, QPixmap or None)
+        self.face_task = None
+        self.media = MediaControls()
+        self.media.pressed.connect(self.media_button)
+        self.media.enable(self.options["media_keys"])
         self.room = self.rooms[0]["room"] if self.rooms else DEFAULT_ROOM
         self.info = {item["room"]: {"uname": item["name"]}
                      for item in self.favorites + self.rooms if item["name"]}
@@ -676,22 +940,21 @@ class Radio(QtCore.QObject):
         self.dock()
 
     def follow_theme(self):
+        """Light/dark mode or the accent color changed."""
         panel_dark = not light_theme("AppsUseLightTheme")
         if panel_dark != self.panel.dark:
             self.panel.dark = panel_dark
-            self.apply_theme()
-            self.update_display()  # the favorite star carries the accent color
             self.panel.apply_backdrop()  # DWM dark-mode frame and tint
-        chip_dark = not light_theme()
-        if chip_dark != self.chip.dark:
-            self.chip.dark = chip_dark
-            self.chip.redraw()
+        self.chip.dark = not light_theme()
+        self.apply_theme()
+        self.update_display()  # also repaints the chip; the favorite star carries the accent
 
     def apply_theme(self):
         dark = self.panel.dark
-        fg, muted, accent = ("#ffffff", "#c5c5c5", "#60cdff") if dark else ("#1b1b1b", "#5c5c5c", "#005fb8")
+        fg, muted, accent = theme_text(dark, self.options["system_accent"])
         on_accent = "#000000" if dark else "#ffffff"
-        accent_hover = "#5ab8e6" if dark else "#1a6dbf"
+        # Fluent's hovered accent fill is the accent at 90% opacity.
+        accent_hover = "rgba({}, {}, {}, 230)".format(*QtGui.QColor(accent).getRgb()[:3])
         edge = "rgba(255,255,255,20)" if dark else "rgba(0,0,0,16)"
         card = "rgba(255,255,255,13)" if dark else "rgba(255,255,255,150)"
         field = "rgba(255,255,255,15)" if dark else "rgba(255,255,255,200)"
@@ -730,8 +993,6 @@ class Radio(QtCore.QObject):
                        selection-color:{on_accent};}}
             QLineEdit:focus {{border-bottom:2px solid {accent};}}
             QLabel#avatar {{background:{row_colors["avatar"]}; color:{row_colors["avatar_text"]}; border-radius:8px;}}
-            QLabel#live {{background:{"#4a2427" if dark else "#fde7e9"}; color:{"#ffb3ba" if dark else "#a4262c"};
-                          padding:0 8px; border-radius:10px; font-weight:600;}}
             QListWidget {{background:transparent; border:none; outline:none;}}
             QScrollBar:vertical {{background:transparent; width:8px; margin:2px 1px;}}
             QScrollBar::handle:vertical {{background:{thumb}; border-radius:3px; min-height:24px;}}
@@ -751,6 +1012,17 @@ class Radio(QtCore.QObject):
         for view in (self.followed, *self.room_views):
             view.itemDelegate().colors = {key: QtGui.QColor(value) for key, value in row_colors.items()}
             view.viewport().update()
+        switch_colors = {"fg": QtGui.QColor(fg), "muted": QtGui.QColor(muted),
+                         "accent": QtGui.QColor(accent), "on_accent": QtGui.QColor(on_accent)}
+        for row in self.setting_rows.values():
+            row.switch.colors = switch_colors
+            row.switch.update()
+        self.live.colors = {key: QtGui.QColor(value) for key, value in zip(
+            ("background", "text", "dot"),
+            ("#4a2427", "#ffb3ba", "#ff99a4") if dark else ("#fde7e9", "#a4262c", "#c42b1c"))}
+        self.live.update()
+        if self.pages.currentWidget() is self.settings_page:
+            self.settings_button.setStyleSheet(f"color:{accent};")
         self.go_action.setIcon(glyph_icon("go", fg))
         self.browser.setIcon(glyph_icon("open", accent, 14))
         self.tabs.update()
@@ -833,10 +1105,7 @@ class Radio(QtCore.QObject):
         texts.setSpacing(0)
         category = QtWidgets.QHBoxLayout()
         category.setSpacing(8)
-        self.live = label("● 直播中")
-        self.live.setObjectName("live")
-        self.live.setFont(app_font(11))
-        self.live.setFixedHeight(20)
+        self.live = LiveBadge("直播中")
         self.area = ElidedLabel(muted=True)
         self.area.setFont(app_font(11))
         category.addWidget(self.live)
@@ -905,8 +1174,30 @@ class Radio(QtCore.QObject):
             pages.addWidget(page)
             self.room_views.append(view)
             self.saved_counts.append((count, hint))
+        settings_page = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(settings_page)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(2)
+        self.setting_rows = {}
+        for key, title, hint in (
+            ("autostart", "开机自动启动", "登录 Windows 后在任务栏显示"),
+            ("reconnect", "断线自动重连", "掉线后最多重试 5 次"),
+            ("media_keys", "媒体键控制", "键盘媒体键和系统音量浮窗"),
+            ("wheel_volume", "滚轮调音量", "在任务栏小组件上滚动"),
+            ("avatar", "显示主播头像", "正在播放卡片上的头像"),
+            ("system_accent", "跟随系统强调色", "关闭时使用默认蓝色"),
+        ):
+            row = SettingRow(title, hint)
+            row.switch.setChecked(autostart_enabled() if key == "autostart" else self.options[key])
+            row.switch.toggled.connect(lambda checked, option=key: self.set_option(option, checked))
+            settings_layout.addWidget(row)
+            self.setting_rows[key] = row
+        settings_layout.addStretch()
+        pages.addWidget(settings_page)
         self.pages = pages
+        self.settings_page = settings_page
         tabs.currentChanged.connect(self.switch_page)
+        tabs.tabBarClicked.connect(self.switch_page)  # also leaves settings via the current tab
         main.addWidget(tabs)
         main.addWidget(pages)
 
@@ -958,9 +1249,12 @@ class Radio(QtCore.QObject):
         browser.setLayoutDirection(QtCore.Qt.RightToLeft)
         browser.setFixedHeight(28)
         footer.addWidget(browser)
+        # Errors and notices only; the playback state is already on the card and the chip.
         self.status = ElidedLabel(muted=True)
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         footer.addWidget(self.status, 1)
+        self.settings_button = icon_button("settings", self.toggle_settings, "设置", 28, 15)
+        footer.addWidget(self.settings_button)
         main.addLayout(footer)
         escape = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self.panel)
         escape.activated.connect(self.panel.hide)
@@ -1009,8 +1303,60 @@ class Radio(QtCore.QObject):
             QtCore.QTimer.singleShot(0, self.place_panel)
 
     def switch_page(self, index):
+        if index < 0:
+            return
+        self.tabs.active = True
+        self.tabs.update()
         self.pages.setCurrentIndex(index)
+        self.settings_button.setStyleSheet("")
         self.fit_lists()
+
+    def toggle_settings(self):
+        if self.pages.currentWidget() is self.settings_page:
+            self.switch_page(self.tabs.currentIndex())
+            return
+        self.tabs.active = False  # no tab is selected while settings are open
+        self.tabs.update()
+        self.pages.setCurrentWidget(self.settings_page)
+        self.settings_button.setStyleSheet(f"color:{self.accent};")
+        self.fit_lists()
+
+    def notify(self, message):
+        self.notice = message
+        self.elide(self.status, message)
+
+    def set_option(self, key, value):
+        if key == "autostart":
+            try:
+                set_autostart(value)
+            except OSError:
+                logging.exception("Changing autostart")
+                switch = self.setting_rows[key].switch
+                switch.blockSignals(True)
+                switch.setChecked(not value)
+                switch.blockSignals(False)
+                self.notify("无法修改开机启动")
+            return
+        self.options[key] = value
+        self.save()
+        if key == "media_keys" and not self.media.enable(value) and value:
+            self.notify("系统媒体控制不可用")
+        elif key == "system_accent":
+            self.apply_theme()
+        elif key == "reconnect" and not value and self.retry_at:
+            self.stop()
+        self.update_display()
+
+    @QtCore.Slot(str)
+    def media_button(self, button):
+        active = self.state in ("loading", "playing")
+        if button == "play" and not active:
+            self.start(self.room)
+        elif button in ("pause", "stop") and active:
+            self.stop()  # a live stream cannot pause; stopping also frees the bandwidth
+
+    def connecting_text(self):
+        return f"重新连接（{self.retries}/5）…" if self.retries else "连接中…"
 
     def account_request(self, action, function, *args):
         self.account_task = action, self.network_pool.submit(function, *args)
@@ -1172,8 +1518,15 @@ class Radio(QtCore.QObject):
     def update_display(self):
         info = self.details()
         name = info.get("uname") or ""
-        self.avatar.setFont(app_font(24, True) if initial(name) else icon_font(24))
-        self.avatar.setText(initial(name) or GLYPHS["music"])
+        self.avatar.setVisible(self.options["avatar"])
+        face_url, face = self.faces.get(info.get("uid"), (None, None))
+        if face:
+            self.avatar.setPixmap(face)
+        else:
+            self.avatar.setFont(app_font(24, True) if initial(name) else icon_font(24))
+            self.avatar.setText(initial(name) or GLYPHS["music"])
+        if self.options["avatar"]:
+            self.want_face(info.get("uid"))
         self.live.setVisible(info.get("live_status") == 1 or self.state == "playing")
         areas = dict.fromkeys(filter(None, (info.get("parent_area_name"), info.get("area_name"))))
         self.elide(self.area, " · ".join(areas), 140)
@@ -1184,11 +1537,11 @@ class Radio(QtCore.QObject):
                                        "error": "refresh"}.get(self.state, "play")])
         self.transport.setAccessibleName("停止" if active else "播放")
         self.stop_control.setEnabled(active)
-        status = {"idle": "未播放", "playing": "播放中",
-                  "loading": "连接中…", "error": self.error}[self.state]
-        self.elide(self.status, status, 180)
+        self.elide(self.status, self.error if self.state == "error" else self.notice)
         if hasattr(self, "chip"):
             self.chip.refresh()
+        self.media.show(self.state, info.get("title") or f"房间 {self.room}",
+                        name or APP_NAME, face_url or info.get("cover"))
         favorite = self.is_favorite(self.room)
         self.favorite_button.setText(GLYPHS["starred" if favorite else "star"])
         self.favorite_button.setStyleSheet(f"color:{self.accent};" if favorite else "")
@@ -1215,11 +1568,46 @@ class Radio(QtCore.QObject):
         self.fit_lists()
 
 
+    def want_face(self, uid):
+        if uid and uid not in self.faces and not (self.face_task and self.face_task[0] == uid):
+            self.face_task = uid, self.network_pool.submit(fetch_face, uid)
+
+    def check_face(self):
+        if not (self.face_task and self.face_task[1].done()):
+            return
+        uid, future = self.face_task
+        self.face_task = None
+        url, content = future.result()
+        image = QtGui.QImage.fromData(content) if content else QtGui.QImage()
+        self.faces[uid] = (url, self.rounded(image) if not image.isNull() else None)
+        if uid == self.details().get("uid"):
+            self.update_display()
+
+    def rounded(self, image):
+        """Crop to a square and round the corners like the avatar tile."""
+        ratio = max(self.panel.devicePixelRatioF(), self.app.primaryScreen().devicePixelRatio(), 1)
+        size = round(56 * ratio)
+        side = min(image.width(), image.height())
+        square = image.copy((image.width() - side) // 2, (image.height() - side) // 2, side, side)
+        square = square.scaled(size, size, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+        result = QtGui.QPixmap(size, size)
+        result.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(result)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(QtCore.QRectF(0, 0, size, size), 8 * ratio, 8 * ratio)
+        painter.setClipPath(path)
+        painter.drawImage(0, 0, square)
+        painter.end()
+        result.setDevicePixelRatio(ratio)
+        return result
+
     def save(self):
         target = STATE_DIR / "settings.json"
         temp = target.with_suffix(".tmp")
         try:
-            temp.write_text(json.dumps({"rooms": self.rooms, "favorites": self.favorites, "volume": self.volume},
+            temp.write_text(json.dumps({"rooms": self.rooms, "favorites": self.favorites,
+                                        "volume": self.volume, "options": self.options},
                                        ensure_ascii=False), encoding="utf-8")
             temp.replace(target)
         except OSError:
@@ -1236,7 +1624,7 @@ class Radio(QtCore.QObject):
             os.startfile(f"https://live.bilibili.com/{self.room}")
         except OSError:
             logging.exception("Opening room in the default browser")
-            self.status.setText("无法打开默认浏览器")
+            self.notify("无法打开默认浏览器")
 
     def play_input(self):
         value = self.input.text()
@@ -1247,12 +1635,13 @@ class Radio(QtCore.QObject):
             try:
                 value = room_number(value)
             except ValueError as error:
-                self.elide(self.status, str(error), 180)
+                self.notify(str(error))
                 return
         self.start(value)
 
-    def start(self, value):
-        self.stop()
+    def start(self, value, retry=False):
+        self.notice = ""
+        self.stop(retry=retry)
         self.room = value if not short_link(value) else self.room
         self.state = "loading"
         self.update_display()
@@ -1264,7 +1653,7 @@ class Radio(QtCore.QObject):
         else:
             self.start(self.room)
 
-    def stop(self, checked=False):
+    def stop(self, checked=False, retry=False):
         self.request += 1
         if self.starting:
             self.starting[1].cancel()
@@ -1272,8 +1661,24 @@ class Radio(QtCore.QObject):
         if self.session:
             self.player_pool.submit(self.session.close)
             self.session = None
+        if not retry:
+            self.retries, self.retry_at = 0, 0
         self.state, self.error = "idle", ""
         self.update_display()
+
+    def reconnect(self, error):
+        """Retry after a dropped stream, backing off; returns False to give up."""
+        offline = "未开播" in error
+        if (not self.options["reconnect"] or self.closing or self.retries >= 5
+                or offline and self.retries):  # the stream ended, not the network
+            return False
+        self.stop(retry=True)
+        self.retries += 1
+        self.retry_at = time.monotonic() + (2, 4, 8, 15, 30)[self.retries - 1]
+        self.state = "loading"
+        logging.info("Playback dropped (%s); reconnect %d/5", error, self.retries)
+        self.update_display()
+        return True
 
     def check_playback(self):
         if self.starting and self.starting[1].done():
@@ -1335,13 +1740,17 @@ class Radio(QtCore.QObject):
             logging.exception("Checking playback")
             error = "无法读取播放状态"
         if error:
-            self.fail(error)
+            # Only streams that were already playing are retried, not a room that never started.
+            if (session.ready or self.retries) and self.reconnect(error):
+                return
+            self.fail("直播已结束" if self.retries and "未开播" in error else error)
             return
-        changed = session.info and self.details() != session.info
+        changed = session.info and {**self.details(), **session.info} != self.details()
         if changed:
-            self.info[self.room] = session.info
+            self.info[self.room] = {**self.details(), **session.info}
         if session.ready and (self.state != "playing" or changed):
             self.state = "playing"
+            self.retries = 0
             self.remember(self.room)
             self.update_display()
 
@@ -1359,8 +1768,12 @@ class Radio(QtCore.QObject):
 
     def tick(self):
         self.update_account()
+        if self.retry_at and time.monotonic() >= self.retry_at:
+            self.retry_at = 0
+            self.start(self.room, retry=True)
         self.check_playback()
         self.check_session()
+        self.check_face()
         if self.recent_info and self.recent_info.done():
             info = self.recent_info.result()
             self.info.update(info)
@@ -1517,7 +1930,10 @@ class Radio(QtCore.QObject):
     def close(self):
         self.closing = True
         self.timer.stop()
+        # Qt may still deliver events to the panel while Python tears this object down.
+        self.content.removeEventFilter(self)
         self.stop()
+        self.media.enable(False)
         self.save()
         self.player_pool.shutdown(wait=True)
         QtCore.QCoreApplication.sendPostedEvents(self, QtCore.QEvent.MetaCall)
