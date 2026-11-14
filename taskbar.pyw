@@ -362,7 +362,7 @@ class RoomDelegate(QtWidgets.QStyledItemDelegate):
 
 
 class SelectorBar(QtWidgets.QTabBar):
-    """Windows 11 SelectorBar: plain labels, a short accent pill under the selected one."""
+    """Windows 11 SelectorBar with icon tabs and a short accent pill under the selected one."""
 
     def __init__(self, colors):
         super().__init__()
@@ -373,9 +373,13 @@ class SelectorBar(QtWidgets.QTabBar):
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self.hovered = -1
 
+    def add(self, title, glyph):
+        index = self.addTab(title)  # the text stays for screen readers
+        self.setTabData(index, GLYPHS[glyph])
+        self.setTabToolTip(index, title)
+
     def tabSizeHint(self, index):
-        width = QtGui.QFontMetrics(app_font(13, True)).horizontalAdvance(self.tabText(index))
-        return QtCore.QSize(width + 28, 36)
+        return QtCore.QSize(48, 36)
 
     def mouseMoveEvent(self, event):
         hovered = self.tabAt(event.position().toPoint())
@@ -400,9 +404,9 @@ class SelectorBar(QtWidgets.QTabBar):
                 p.setPen(QtCore.Qt.NoPen)
                 p.setBrush(c["hover"])
                 p.drawRoundedRect(QtCore.QRectF(bounds).adjusted(2, 3, -2, -3), 5, 5)
-            p.setFont(app_font(13, selected))
-            p.setPen(c["fg"] if selected or index == self.hovered else c["muted"])
-            p.drawText(bounds.adjusted(0, 0, 0, -3), QtCore.Qt.AlignCenter, self.tabText(index))
+            p.setFont(icon_font(16))
+            p.setPen(c["accent"] if selected else c["fg"] if index == self.hovered else c["muted"])
+            p.drawText(bounds.adjusted(0, 0, 0, -3), QtCore.Qt.AlignCenter, self.tabData(index))
             if selected:
                 p.setPen(QtCore.Qt.NoPen)
                 p.setBrush(c["accent"])
@@ -530,8 +534,8 @@ class Chip(QtWidgets.QWidget):
             p.drawText(avatar, QtCore.Qt.AlignCenter, glyph)
 
         labels = {
-            "idle": ("B 站直播", "点一下选直播间", GLYPHS["play"]),
-            "loading": ("正在连接…", radio.room, GLYPHS["stop"]),
+            "idle": ("B 站直播", "未播放", GLYPHS["play"]),
+            "loading": ("连接中…", radio.room, GLYPHS["stop"]),
             "playing": (info.get("uname") or radio.room, info.get("title") or "仅播放音频", GLYPHS["pause"]),
             "error": (radio.error or "播放失败", radio.room, GLYPHS["refresh"]),
         }
@@ -567,7 +571,7 @@ GLYPHS = {
     "play": "", "pause": "", "stop": "", "refresh": "",
     "star": "", "starred": "", "go": "", "hide": "",
     "power": "", "more": "", "volume": "", "mute": "",
-    "music": "", "open": "",
+    "music": "", "open": "", "people": "", "history": "",
 }
 
 
@@ -818,13 +822,12 @@ class Radio(QtCore.QObject):
         follow_layout = QtWidgets.QVBoxLayout(follow_page)
         follow_layout.setContentsMargins(0, 0, 0, 0)
         follow_layout.setSpacing(6)
-        tabs.addTab("关注")
+        tabs.add("关注", "people")
         pages.addWidget(follow_page)
         self.room_views = []
         self.saved_counts = []
-        for title, hint in (("收藏", "还没有收藏。点上方的星标，或右键房间收藏"),
-                            ("历史", "还没有播放记录")):
-            tabs.addTab(title)
+        for title, glyph, hint in (("收藏", "star", "暂无收藏"), ("历史", "history", "暂无记录")):
+            tabs.add(title, glyph)
             page = QtWidgets.QWidget()
             layout = QtWidgets.QVBoxLayout(page)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -834,13 +837,15 @@ class Radio(QtCore.QObject):
             layout.addWidget(count)
             view = QtWidgets.QListWidget()
             view.setAccessibleName(title)
-            layout.addWidget(view, 1)
+            layout.addWidget(view)
+            layout.addStretch()
             pages.addWidget(page)
             self.room_views.append(view)
             self.saved_counts.append((count, hint))
-        tabs.currentChanged.connect(pages.setCurrentIndex)
+        self.pages = pages
+        tabs.currentChanged.connect(self.switch_page)
         main.addWidget(tabs)
-        main.addWidget(pages, 1)
+        main.addWidget(pages)
 
         followed_header = QtWidgets.QHBoxLayout()
         followed_header.setSpacing(4)
@@ -866,18 +871,16 @@ class Radio(QtCore.QObject):
             view.setUniformItemSizes(True)
             view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
             view.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
-            view.setMinimumHeight(3 * 46)
             view.itemClicked.connect(self.play_list_room)
             view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             view.customContextMenuRequested.connect(lambda point, target=view: self.room_menu(target, point))
         self.followed.setAccessibleName("正在开播的关注")
-        self.followed.setVisible(bool(self.cookies))
-        follow_layout.addWidget(self.followed, 1)
+        follow_layout.addWidget(self.followed)
+        follow_layout.addStretch()
         self.update_account_controls()
-        self.account_status.setText("点刷新查看正在开播的关注" if self.cookies else
-                                    "登录后可以看到关注中正在开播的主播")
+        self.account_status.setText("点刷新查看" if self.cookies else "登录后查看关注开播")
 
-        self.input = QtWidgets.QLineEdit(placeholderText="输入房间号、直播链接或 b23.tv 短链")
+        self.input = QtWidgets.QLineEdit(placeholderText="房间号或直播链接")
         self.input.setAccessibleName("切换直播间")
         self.input.setFixedHeight(34)
         go = self.input.addAction(glyph_icon("go", fg), QtWidgets.QLineEdit.TrailingPosition)
@@ -888,7 +891,7 @@ class Radio(QtCore.QObject):
 
         main.addWidget(divider())
         footer = QtWidgets.QHBoxLayout()
-        browser = button("在浏览器中打开", self.open_room, "link")
+        browser = button("网页打开", self.open_room, "link")
         browser.setIcon(glyph_icon("open", accent, 14))
         browser.setLayoutDirection(QtCore.Qt.RightToLeft)
         browser.setFixedHeight(28)
@@ -914,13 +917,37 @@ class Radio(QtCore.QObject):
 
     def update_account_controls(self):
         busy = self.account_task is not None
-        self.followed.setVisible(bool(self.cookies))
         self.account_refresh.setVisible(bool(self.cookies))
         self.account_refresh.setEnabled(not busy)
         self.account_more.setVisible(bool(self.cookies))
         self.account_action.setVisible(not self.cookies)
         self.account_action.setText("取消登录" if self.qr_key else "扫码登录")
         self.account_action.setEnabled(not busy or bool(self.qr_key))
+        self.fit_lists()
+
+    def fit_lists(self):
+        """Lists hug their rows and scroll past four; the panel hugs the current tab."""
+        for view in [self.followed, *self.room_views]:
+            rows = view.count()
+            view.setFixedHeight(min(rows, 4) * 46)
+            view.setVisible(rows > 0 and (view is not self.followed or bool(self.cookies)))
+        current = self.pages.currentIndex()
+        for index in range(self.pages.count()):
+            # QStackedWidget sizes to its largest page unless the others are Ignored.
+            policy = (QtWidgets.QSizePolicy.Preferred if index == current
+                      else QtWidgets.QSizePolicy.Ignored)
+            self.pages.widget(index).setSizePolicy(policy, policy)
+            self.pages.widget(index).updateGeometry()
+        self.pages.updateGeometry()
+        self.content.layout().invalidate()
+        self.content.layout().activate()
+        if self.panel.isVisible():
+            # Measure after Qt has processed the size changes posted above.
+            QtCore.QTimer.singleShot(0, self.place_panel)
+
+    def switch_page(self, index):
+        self.pages.setCurrentIndex(index)
+        self.fit_lists()
 
     def account_request(self, action, function, *args):
         self.account_task = action, self.network_pool.submit(function, *args)
@@ -956,7 +983,7 @@ class Radio(QtCore.QObject):
 
     def refresh_followed(self):
         if self.cookies and not self.account_task:
-            self.account_status.setText("正在读取关注直播…")
+            self.account_status.setText("读取中…")
             self.account_request("followed", account.followed_live, self.cookies.copy())
 
     def show_qr(self, url):
@@ -988,7 +1015,7 @@ class Radio(QtCore.QObject):
                     url, self.qr_key = result
                     self.qr_deadline = time.monotonic() + 180
                     self.show_qr(url)
-                    self.account_status.setText("用哔哩哔哩 App 扫码并确认")
+                    self.account_status.setText("用 B 站 App 扫码")
                 elif action == "poll":
                     code, cookies = result
                     if code == 0:
@@ -997,7 +1024,7 @@ class Radio(QtCore.QObject):
                         self.end_qr("登录成功")
                         self.refresh_followed()
                     elif code == 86090:
-                        self.account_status.setText("已扫码，请在手机上确认")
+                        self.account_status.setText("请在手机上确认")
                     elif code != 86101:
                         self.end_qr("二维码已失效，请重新扫码")
                 else:
@@ -1006,8 +1033,7 @@ class Radio(QtCore.QObject):
                         self.followed.addItem(room_item(room, info, info["uname"],
                                                         info["title"] or f"房间 {room}"))
                     self.sync_room_selection()
-                    self.account_status.setText(f"{len(result)} 个房间正在直播" if result else
-                                                "关注的主播暂时没有开播")
+                    self.account_status.setText(f"{len(result)} 人开播" if result else "暂无开播")
             except account.LoginExpired as error:
                 try:
                     self.account_path.unlink(missing_ok=True)
@@ -1090,14 +1116,14 @@ class Radio(QtCore.QObject):
         areas = dict.fromkeys(filter(None, (info.get("parent_area_name"), info.get("area_name"))))
         self.elide(self.area, " · ".join(areas), 140)
         self.elide(self.title, info.get("title") or f"房间 {self.room}", 226)
-        self.elide(self.byline, f"{name} · 房间 {self.room}" if name else f"房间 {self.room}", 226)
+        self.elide(self.byline, f"{name} · {self.room}" if name else f"房间 {self.room}", 226)
         active = self.state in ("playing", "loading")
         self.transport.setText(GLYPHS[{"playing": "pause", "loading": "stop",
                                        "error": "refresh"}.get(self.state, "play")])
         self.transport.setAccessibleName("停止" if active else "播放")
         self.stop_control.setEnabled(active)
-        status = {"idle": "待播放", "playing": "已连接 · 仅播放音频",
-                  "loading": "正在连接…", "error": self.error}[self.state]
+        status = {"idle": "未播放", "playing": "播放中",
+                  "loading": "连接中…", "error": self.error}[self.state]
         self.elide(self.status, status, 180)
         if hasattr(self, "chip"):
             self.chip.refresh()
@@ -1122,7 +1148,9 @@ class Radio(QtCore.QObject):
                 name = info.get("uname") or record["name"] or f"房间 {room}"
                 view.addItem(room_item(room, info, name, info.get("title") or f"房间 {room}"))
             view.verticalScrollBar().setValue(scroll)
-            count.setText(f"{len(records)} 个房间" if records else hint)
+            count.setText(hint)
+            count.setVisible(not records)
+        self.fit_lists()
 
 
     def save(self):
@@ -1405,9 +1433,6 @@ class Radio(QtCore.QObject):
         bottom = (round(screen.height() * scale) - gap if at_top else
                   (self.anchor[1] if self.anchor else bar.top if bar else round(screen.height() * scale)) - gap)
         desired = self.content.sizeHint().height()
-        if self.cookies:
-            # Keep the logged-in viewport stable when history and follow data arrive.
-            desired = max(560, desired)
         logical_height = min(desired, max(1, int((bottom - top) / scale)))
         width, height = round(368 * scale), round(logical_height * scale)
         x = self.anchor[0] if self.anchor else round(8 * scale)
