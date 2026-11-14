@@ -1,0 +1,9 @@
+PySide6-Essentials>=6.8
+streamlink>=7.0
+requests>=2.31
+qrcode>=8.0
+winrt-runtime>=3.0
+winrt-Windows.Foundation>=3.0
+winrt-Windows.Media>=3.0
+winrt-Windows.Media.Playback>=3.0
+winrt-Windows.Storage.Streams>=3.0
