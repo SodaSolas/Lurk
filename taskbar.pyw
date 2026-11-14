@@ -51,6 +51,7 @@ show_window = native(USER, "ShowWindow", wt.BOOL, wt.HWND, ct.c_int)
 visible = native(USER, "IsWindowVisible", wt.BOOL, wt.HWND)
 get_dpi = native(USER, "GetDpiForWindow", wt.UINT, wt.HWND)
 is_window = native(USER, "IsWindow", wt.BOOL, wt.HWND)
+invalidate_rect = native(USER, "InvalidateRect", wt.BOOL, wt.HWND, ct.c_void_p, wt.BOOL)
 get_foreground = native(USER, "GetForegroundWindow", wt.HWND)
 monitor_from_window = native(USER, "MonitorFromWindow", wt.HANDLE, wt.HWND, wt.DWORD)
 is_zoomed = native(USER, "IsZoomed", wt.BOOL, wt.HWND)
@@ -248,6 +249,7 @@ class Playback:
 
 class Flyout(QtWidgets.QWidget):
     dismissed = QtCore.Signal()
+    theme_changed = QtCore.Signal()
 
     def __init__(self, dark):
         # No FramelessWindowHint: Qt makes frameless translucent windows layered, and DWM
@@ -265,6 +267,10 @@ class Flyout(QtWidgets.QWidget):
             return True, 0
         if msg.message == 0x0084:  # WM_NCHITTEST: no resize edges or caption
             return True, 1
+        # WM_SETTINGCHANGE "ImmersiveColorSet": light/dark mode switched. Only top-level
+        # windows get the broadcast, so the panel relays it for the taskbar chip as well.
+        if msg.message == 0x001A and msg.lParam and ct.wstring_at(msg.lParam) == "ImmersiveColorSet":
+            self.theme_changed.emit()
         return super().nativeEvent(kind, message)
 
     def apply_backdrop(self):
@@ -303,6 +309,35 @@ class Flyout(QtWidgets.QWidget):
         return super().event(event)
 
 
+class ElidedLabel(QtWidgets.QLabel):
+    """Elides to the width it is given and never asks for more, so long room names,
+    titles or areas cannot widen the panel past its edge."""
+
+    def __init__(self, text="", muted=False):
+        super().__init__()
+        self.setTextFormat(QtCore.Qt.PlainText)
+        self.setProperty("muted", muted)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.full_text = ""
+        self.set_full_text(text)
+
+    def set_full_text(self, text):
+        self.full_text = text
+        self.refresh()
+
+    def refresh(self):
+        shown = self.fontMetrics().elidedText(self.full_text, QtCore.Qt.ElideRight, max(0, self.width()))
+        super().setText(shown)
+        self.setToolTip(self.full_text if shown != self.full_text else "")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.refresh()
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(0, super().minimumSizeHint().height())
+
+
 ROW_TEXT = QtCore.Qt.UserRole + 1  # (name, detail) shown on a room row
 
 
@@ -317,9 +352,9 @@ def room_item(room, info, name, detail):
 class RoomDelegate(QtWidgets.QStyledItemDelegate):
     """A Fluent list row: avatar initial, name over a muted detail line."""
 
-    def __init__(self, view, colors):
+    def __init__(self, view):
         super().__init__(view)
-        self.colors = {key: QtGui.QColor(value) for key, value in colors.items()}
+        self.colors = {}  # set by Radio.apply_theme
 
     def sizeHint(self, option, index):
         return QtCore.QSize(0, 46)
@@ -339,14 +374,7 @@ class RoomDelegate(QtWidgets.QStyledItemDelegate):
             painter.setBrush(c["accent"])
             painter.drawRoundedRect(QtCore.QRectF(bounds.left(), bounds.center().y() - 8, 3, 16), 1.5, 1.5)
         name, detail = index.data(ROW_TEXT) or (index.data(), "")
-        avatar = QtCore.QRect(bounds.left() + 12, bounds.center().y() - 13, 26, 26)
-        painter.setBrush(c["avatar"])
-        painter.drawEllipse(avatar)
-        painter.setPen(c["avatar_text"])
-        letter = initial(name)
-        painter.setFont(app_font(12, True) if letter else icon_font(12))
-        painter.drawText(avatar, QtCore.Qt.AlignCenter, letter or GLYPHS["music"])
-        left = avatar.right() + 11
+        left = bounds.left() + 14
         width = bounds.right() - left - 8
         for text, top, size, color in ((name, -18, 13, "fg"), (detail, 1, 11, "muted")):
             painter.setFont(app_font(size))
@@ -364,9 +392,9 @@ class RoomDelegate(QtWidgets.QStyledItemDelegate):
 class SelectorBar(QtWidgets.QTabBar):
     """Windows 11 SelectorBar with icon tabs and a short accent pill under the selected one."""
 
-    def __init__(self, colors):
+    def __init__(self):
         super().__init__()
-        self.colors = {key: QtGui.QColor(value) for key, value in colors.items()}
+        self.colors = {}  # set by Radio.apply_theme
         self.setDrawBase(False)
         self.setExpanding(False)
         self.setMouseTracking(True)
@@ -465,9 +493,17 @@ class Chip(QtWidgets.QWidget):
         self.animation = QtCore.QTimer(self, interval=110)
         self.animation.timeout.connect(self.animate)
 
+    def redraw(self):
+        """Paint now. Embedded in Explorer's taskbar, the widget never gets Qt's expose
+        and deferred update requests, so update() would leave it stuck on its first frame."""
+        handle = self.windowHandle()
+        if handle and not handle.isExposed():
+            invalidate_rect(int(self.winId()), None, False)
+        self.repaint()
+
     def animate(self):
         self.phase = (self.phase + 1) % 12
-        self.update()
+        self.redraw()
 
     def refresh(self):
         active = self.radio.state in ("loading", "playing") and self.isVisible()
@@ -475,18 +511,18 @@ class Chip(QtWidgets.QWidget):
             self.animation.start()
         elif not active:
             self.animation.stop()
-        self.update()
+        self.redraw()
 
     def mouseMoveEvent(self, event):
         self.hover_button = event.position().x() >= 198
-        self.update()
+        self.redraw()
 
     def enterEvent(self, event):
-        self.update()
+        self.redraw()
 
     def leaveEvent(self, event):
         self.hover_button = False
-        self.update()
+        self.redraw()
 
     def mouseReleaseEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton and self.rect().contains(event.position().toPoint()):
@@ -513,46 +549,39 @@ class Chip(QtWidgets.QWidget):
             p.setBrush(QtGui.QColor(255, 255, 255, 22) if dark else QtGui.QColor(0, 0, 0, 16))
             p.drawRoundedRect(198, 6, 28, 28, 5, 5)
 
-        avatar = QtCore.QRect(6, 6, 28, 28)
-        p.setBrush(QtGui.QColor("#1f3a5a" if dark else "#dbe8f8"))
-        glyph, ink, glyph_font = GLYPHS["music"], accent, icon_font(14)
-        if state == "error":
-            p.setBrush(QtGui.QColor("#433519" if dark else "#fff4ce"))
-            glyph, ink, glyph_font = "!", "#fce100" if dark else "#8a5300", app_font(14, True)
-        elif state == "playing":
-            if initial(info.get("uname")):
-                glyph, glyph_font = initial(info.get("uname")), app_font(13, True)
-            p.setPen(QtGui.QPen(QtGui.QColor(accent), 1.5))
+        # The left slot shows playback state: sound bars (moving while playing, flat and
+        # grey when idle), a spinner while connecting, a warning on errors.
+        slot = QtCore.QRect(10, 10, 20, 20)
         if state == "loading":
             p.setBrush(QtCore.Qt.NoBrush)
             p.setPen(QtGui.QPen(QtGui.QColor(accent), 2))
-            p.drawArc(avatar.adjusted(3, 3, -3, -3), self.phase * 480, 245 * 16)
+            p.drawArc(slot.adjusted(3, 3, -3, -3), self.phase * 480, 245 * 16)
+        elif state == "error":
+            p.setPen(QtGui.QColor("#fce100" if dark else "#9d5d00"))
+            p.setFont(icon_font(15))
+            p.drawText(slot, QtCore.Qt.AlignCenter, GLYPHS["warning"])
         else:
-            p.drawEllipse(avatar)
-            p.setPen(QtGui.QColor(ink))
-            p.setFont(glyph_font)
-            p.drawText(avatar, QtCore.Qt.AlignCenter, glyph)
-
-        labels = {
-            "idle": ("B 站直播", "未播放", GLYPHS["play"]),
-            "loading": ("连接中…", radio.room, GLYPHS["stop"]),
-            "playing": (info.get("uname") or radio.room, info.get("title") or "仅播放音频", GLYPHS["pause"]),
-            "error": (radio.error or "播放失败", radio.room, GLYPHS["refresh"]),
-        }
-        title, subtitle, action = labels[state]
-        for text, y, size, color in ((title, 4, 12, fg), (subtitle, 20, 11, muted)):
-            font = app_font(size, y == 4)
-            p.setFont(font)
-            p.setPen(QtGui.QColor(color))
-            width = 125 if state == "playing" else 150
-            p.drawText(QtCore.QRect(44, y, width, 16), QtCore.Qt.AlignVCenter,
-                       p.fontMetrics().elidedText(text, QtCore.Qt.ElideRight, width))
-        if state == "playing":
+            playing = state == "playing"
             p.setPen(QtCore.Qt.NoPen)
-            p.setBrush(QtGui.QColor(accent))
+            p.setBrush(QtGui.QColor(accent if playing else muted))
             for i in range(3):
-                height = (8, 11, 14, 11)[(self.phase + i) % 4]
-                p.drawRoundedRect(176 + i * 5, 20 - height // 2, 3, height, 1, 1)
+                height = (6, 10, 14, 10)[(self.phase + i) % 4] if playing else (6, 9, 6)[i]
+                p.drawRoundedRect(QtCore.QRectF(slot.left() + 4 + i * 5, 20 - height / 2, 3, height), 1.5, 1.5)
+
+        name = info.get("uname") or f"房间 {radio.room}"
+        detail = {
+            "idle": "未播放",
+            "loading": "连接中…",
+            "playing": info.get("title") or "播放中",
+            "error": radio.error or "播放失败",
+        }[state]
+        action = GLYPHS[{"idle": "play", "loading": "stop", "playing": "pause", "error": "refresh"}[state]]
+        width = 158
+        for text, y, size, color in ((name, 4, 12, fg), (detail, 20, 11, muted)):
+            p.setFont(app_font(size, y == 4))
+            p.setPen(QtGui.QColor(color))
+            p.drawText(QtCore.QRect(36, y, width, 16), QtCore.Qt.AlignVCenter,
+                       p.fontMetrics().elidedText(text, QtCore.Qt.ElideRight, width))
         p.setFont(icon_font(14))
         p.setPen(QtGui.QColor(fg))
         p.drawText(QtCore.QRect(198, 6, 28, 28), QtCore.Qt.AlignCenter, action)
@@ -572,6 +601,7 @@ GLYPHS = {
     "star": "", "starred": "", "go": "", "hide": "",
     "power": "", "more": "", "volume": "", "mute": "",
     "music": "", "open": "", "people": "", "history": "",
+    "warning": "",
 }
 
 
@@ -607,6 +637,7 @@ class Radio(QtCore.QObject):
         self.info = {item["room"]: {"uname": item["name"]}
                      for item in self.favorites + self.rooms if item["name"]}
         self.room_menu_open = False
+        self.placing = False
         self.state, self.error = "idle", ""
         self.bar = self.anchor = None
         self.dismissed_at = 0
@@ -633,6 +664,8 @@ class Radio(QtCore.QObject):
         self.save_timer.timeout.connect(self.save)
         self.panel = Flyout(not light_theme("AppsUseLightTheme"))
         self.panel.dismissed.connect(self.dismiss_panel)
+        # The registry may lag the broadcast slightly, so read it a moment later.
+        self.panel.theme_changed.connect(lambda: QtCore.QTimer.singleShot(300, self.follow_theme))
         self.launched.connect(self.accept_launch, QtCore.Qt.QueuedConnection)
         self.build_panel()
         self.chip = Chip(self)
@@ -642,7 +675,19 @@ class Radio(QtCore.QObject):
         self.timer.start()
         self.dock()
 
-    def build_panel(self):
+    def follow_theme(self):
+        panel_dark = not light_theme("AppsUseLightTheme")
+        if panel_dark != self.panel.dark:
+            self.panel.dark = panel_dark
+            self.apply_theme()
+            self.update_display()  # the favorite star carries the accent color
+            self.panel.apply_backdrop()  # DWM dark-mode frame and tint
+        chip_dark = not light_theme()
+        if chip_dark != self.chip.dark:
+            self.chip.dark = chip_dark
+            self.chip.redraw()
+
+    def apply_theme(self):
         dark = self.panel.dark
         fg, muted, accent = ("#ffffff", "#c5c5c5", "#60cdff") if dark else ("#1b1b1b", "#5c5c5c", "#005fb8")
         on_accent = "#000000" if dark else "#ffffff"
@@ -672,7 +717,7 @@ class Radio(QtCore.QObject):
             QPushButton:pressed {{background:{pressed}; color:{muted};}}
             QPushButton:focus {{border-color:{accent};}}
             QPushButton:disabled {{color:{muted};}}
-            QPushButton[icon="true"] {{padding:0;}}
+            QPushButton[glyph="true"] {{padding:0;}}
             QPushButton#transport {{background:{accent}; color:{on_accent}; border-radius:20px;}}
             QPushButton#transport:hover {{background:{accent_hover};}}
             QPushButton#stop {{background:{hover}; border:1px solid {edge}; border-radius:16px;}}
@@ -686,7 +731,7 @@ class Radio(QtCore.QObject):
             QLineEdit:focus {{border-bottom:2px solid {accent};}}
             QLabel#avatar {{background:{row_colors["avatar"]}; color:{row_colors["avatar_text"]}; border-radius:8px;}}
             QLabel#live {{background:{"#4a2427" if dark else "#fde7e9"}; color:{"#ffb3ba" if dark else "#a4262c"};
-                          padding:1px 7px; border-radius:9px; font-weight:600;}}
+                          padding:0 8px; border-radius:10px; font-weight:600;}}
             QListWidget {{background:transparent; border:none; outline:none;}}
             QScrollBar:vertical {{background:transparent; width:8px; margin:2px 1px;}}
             QScrollBar::handle:vertical {{background:{thumb}; border-radius:3px; min-height:24px;}}
@@ -696,6 +741,22 @@ class Radio(QtCore.QObject):
             QMenu::item {{padding:7px 28px 7px 12px; border-radius:4px;}}
             QMenu::item:selected {{background:{hover};}}
         """)
+        self.logo.setStyleSheet(f"color:{accent};")
+        palette = self.slider.palette()
+        palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(accent))
+        palette.setColor(QtGui.QPalette.Mid, QtGui.QColor("#8b8b8b" if dark else "#8a8a8a"))
+        palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#454545" if dark else "#ffffff"))
+        self.slider.setPalette(palette)
+        self.tabs.colors = {key: QtGui.QColor(row_colors[key]) for key in ("fg", "muted", "accent", "hover")}
+        for view in (self.followed, *self.room_views):
+            view.itemDelegate().colors = {key: QtGui.QColor(value) for key, value in row_colors.items()}
+            view.viewport().update()
+        self.go_action.setIcon(glyph_icon("go", fg))
+        self.browser.setIcon(glyph_icon("open", accent, 14))
+        self.tabs.update()
+        self.panel.update()
+
+    def build_panel(self):
         self.panel.setFixedWidth(368)
         self.panel.setFont(app_font(12))
         outer = QtWidgets.QVBoxLayout(self.panel)
@@ -710,6 +771,9 @@ class Radio(QtCore.QObject):
         scroll.setWidget(content)
         outer.addWidget(scroll)
         self.content = content
+        # Resize the panel whenever its content relayouts (lists filled, QR code shown...);
+        # otherwise the outer scroll bar appears and squeezes the content from the right.
+        content.installEventFilter(self)
         main = QtWidgets.QVBoxLayout(content)
         main.setContentsMargins(16, 12, 16, 14)
         main.setSpacing(12)
@@ -735,7 +799,7 @@ class Radio(QtCore.QObject):
         def icon_button(glyph, action, tip, size=32, glyph_size=16, name=""):
             result = button(GLYPHS[glyph], action, name, (size, size), tip)
             result.setFont(icon_font(glyph_size))
-            result.setProperty("icon", True)
+            result.setProperty("glyph", True)  # not "icon": QPushButton already has that property
             return result
 
         def divider():
@@ -745,9 +809,8 @@ class Radio(QtCore.QObject):
 
         header = QtWidgets.QHBoxLayout()
         header.setSpacing(8)
-        logo = label(GLYPHS["music"])
+        self.logo = logo = label(GLYPHS["music"])
         logo.setFont(icon_font(14))
-        logo.setStyleSheet(f"color:{accent};")
         header.addWidget(logo)
         header.addWidget(label(APP_NAME, True))
         header.addStretch()
@@ -765,28 +828,33 @@ class Radio(QtCore.QObject):
         self.avatar.setObjectName("avatar")
         self.avatar.setFixedSize(56, 56)
         self.avatar.setAlignment(QtCore.Qt.AlignCenter)
-        summary.addWidget(self.avatar, 0, QtCore.Qt.AlignTop)
+        summary.addWidget(self.avatar, 0, QtCore.Qt.AlignVCenter)
         texts = QtWidgets.QVBoxLayout()
-        texts.setSpacing(2)
+        texts.setSpacing(0)
         category = QtWidgets.QHBoxLayout()
-        category.setSpacing(6)
+        category.setSpacing(8)
         self.live = label("● 直播中")
         self.live.setObjectName("live")
         self.live.setFont(app_font(11))
-        self.area = label(muted=True)
+        self.live.setFixedHeight(20)
+        self.area = ElidedLabel(muted=True)
         self.area.setFont(app_font(11))
         category.addWidget(self.live)
         category.addWidget(self.area, 1)
-        self.favorite_button = icon_button("star", self.favorite_current, "收藏当前房间", 28, 14)
-        category.addWidget(self.favorite_button)
         texts.addLayout(category)
-        self.title = label()
+        texts.addSpacing(6)
+        self.title = ElidedLabel()
         self.title.setFont(app_font(14, True))
-        self.byline = label(muted=True)
+        self.byline = ElidedLabel(muted=True)
         texts.addWidget(self.title)
+        texts.addSpacing(3)
         texts.addWidget(self.byline)
         summary.addLayout(texts, 1)
+        # The star sits in its own column so it does not stretch the badge row.
+        self.favorite_button = icon_button("star", self.favorite_current, "收藏当前房间", 28, 14)
+        summary.addWidget(self.favorite_button, 0, QtCore.Qt.AlignTop)
         body.addLayout(summary)
+        body.addSpacing(4)
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(8)
         self.transport = icon_button("play", self.toggle_playback, "播放", 40, 16, "transport")
@@ -797,14 +865,9 @@ class Radio(QtCore.QObject):
         self.speaker = label(GLYPHS["mute" if self.volume == 0 else "volume"])
         self.speaker.setFont(icon_font(16))
         controls.addWidget(self.speaker)
-        slider = VolumeSlider(QtCore.Qt.Horizontal)
+        self.slider = slider = VolumeSlider(QtCore.Qt.Horizontal)
         slider.setRange(0, 100)
         slider.setFixedHeight(28)
-        palette = slider.palette()
-        palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(accent))
-        palette.setColor(QtGui.QPalette.Mid, QtGui.QColor("#8b8b8b" if dark else "#8a8a8a"))
-        palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#454545" if dark else "#ffffff"))
-        slider.setPalette(palette)
         slider.setAccessibleName("音量")
         slider.setValue(self.volume)
         slider.valueChanged.connect(self.change_volume)
@@ -816,7 +879,7 @@ class Radio(QtCore.QObject):
         body.addLayout(controls)
         main.addWidget(now)
 
-        tabs = SelectorBar({"fg": fg, "muted": muted, "accent": accent, "hover": row_colors["hover"]})
+        self.tabs = tabs = SelectorBar()
         pages = QtWidgets.QStackedWidget()
         follow_page = QtWidgets.QWidget()
         follow_layout = QtWidgets.QVBoxLayout(follow_page)
@@ -866,7 +929,7 @@ class Radio(QtCore.QObject):
         follow_layout.addWidget(self.account_qr)
         self.followed = QtWidgets.QListWidget()
         for view in [self.followed, *self.room_views]:
-            view.setItemDelegate(RoomDelegate(view, row_colors))
+            view.setItemDelegate(RoomDelegate(view))
             view.setMouseTracking(True)
             view.setUniformItemSizes(True)
             view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -883,7 +946,7 @@ class Radio(QtCore.QObject):
         self.input = QtWidgets.QLineEdit(placeholderText="房间号或直播链接")
         self.input.setAccessibleName("切换直播间")
         self.input.setFixedHeight(34)
-        go = self.input.addAction(glyph_icon("go", fg), QtWidgets.QLineEdit.TrailingPosition)
+        self.go_action = go = self.input.addAction(QtGui.QIcon(), QtWidgets.QLineEdit.TrailingPosition)
         go.setToolTip("播放这个房间")
         go.triggered.connect(self.play_input)
         self.input.returnPressed.connect(self.play_input)
@@ -891,17 +954,17 @@ class Radio(QtCore.QObject):
 
         main.addWidget(divider())
         footer = QtWidgets.QHBoxLayout()
-        browser = button("网页打开", self.open_room, "link")
-        browser.setIcon(glyph_icon("open", accent, 14))
+        self.browser = browser = button("网页打开", self.open_room, "link")
         browser.setLayoutDirection(QtCore.Qt.RightToLeft)
         browser.setFixedHeight(28)
         footer.addWidget(browser)
-        footer.addStretch()
-        self.status = label(muted=True)
-        footer.addWidget(self.status)
+        self.status = ElidedLabel(muted=True)
+        self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        footer.addWidget(self.status, 1)
         main.addLayout(footer)
         escape = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self.panel)
         escape.activated.connect(self.panel.hide)
+        self.apply_theme()
         self.update_display()
 
     def account_menu(self):
@@ -1103,9 +1166,8 @@ class Radio(QtCore.QObject):
         return self.info.get(self.room, {})
 
     @staticmethod
-    def elide(label, text, width):
-        label.setText(label.fontMetrics().elidedText(text, QtCore.Qt.ElideRight, width))
-        label.setToolTip(text)
+    def elide(label, text, width=None):
+        label.set_full_text(text)
 
     def update_display(self):
         info = self.details()
@@ -1362,7 +1424,7 @@ class Radio(QtCore.QObject):
             if get_parent(hwnd) != bar:
                 update_long(hwnd, -16, 0x40000000, 0x80000000)
                 set_parent(hwnd, bar)
-                self.chip.update()
+                self.chip.redraw()
             origin = wt.POINT(*slot[:2])
             screen_to_client(bar, ct.byref(origin))
             positioned = get_parent(hwnd) == bar and set_position(hwnd, 0, origin.x, origin.y, *slot[2:], 0x50)
@@ -1423,7 +1485,15 @@ class Radio(QtCore.QObject):
         self.panel.activateWindow()
         self.chip.refresh()
 
+    def eventFilter(self, watched, event):
+        if (watched is self.content and event.type() == QtCore.QEvent.LayoutRequest
+                and self.panel.isVisible() and not self.placing):
+            self.placing = True
+            QtCore.QTimer.singleShot(0, self.place_panel)
+        return False
+
     def place_panel(self):
+        self.placing = False
         scale = (get_dpi(self.bar) or 96) / 96 if self.bar else self.panel.devicePixelRatioF()
         bar = rect(self.bar)
         screen = self.app.primaryScreen().geometry()
@@ -1432,6 +1502,7 @@ class Radio(QtCore.QObject):
         top = ((self.anchor[1] + self.anchor[3] if self.anchor else bar.bottom) + gap) if at_top else gap
         bottom = (round(screen.height() * scale) - gap if at_top else
                   (self.anchor[1] if self.anchor else bar.top if bar else round(screen.height() * scale)) - gap)
+        self.content.layout().activate()
         desired = self.content.sizeHint().height()
         logical_height = min(desired, max(1, int((bottom - top) / scale)))
         width, height = round(368 * scale), round(logical_height * scale)
